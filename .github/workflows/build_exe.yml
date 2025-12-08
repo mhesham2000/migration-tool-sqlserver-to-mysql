@@ -1,0 +1,65 @@
+# .github/workflows/build_exe.yml
+
+name: Build and Release Windows Executable (Push to Main)
+
+on:
+  # 🚨 CHANGE 1: Trigger on every push to the 'main' branch
+  push:
+    branches:
+      - main 
+
+jobs:
+  build_release:
+    runs-on: windows-latest
+    permissions:
+      contents: write 
+
+    steps:
+    - name: ⬇️ Checkout Code
+      uses: actions/checkout@v4
+      # Fetch all history and tags (crucial for accurate SHA)
+      with:
+        fetch-depth: 0 
+
+    # 🚨 NEW STEP: Generate a unique tag based on commit hash and date
+    - name: 🏷️ Generate Version Tag
+      id: generate_tag
+      run: |
+        # Get short commit SHA
+        SHA=$(git rev-parse --short ${{ github.sha }})
+        # Get current date in YYYYMMDD format
+        DATE=$(date +%Y%m%d)
+        # Create a build tag (e.g., build-20251208-abcdefg)
+        NEW_TAG="build-${DATE}-${SHA}"
+        echo "NEW_TAG=$NEW_TAG" >> $GITHUB_OUTPUT
+        
+        # Create and push the tag immediately so the release action can find it
+        git tag $NEW_TAG
+        git push origin $NEW_TAG
+
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11' 
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install cx_Freeze pyodbc mysql-connector-python PyQt5
+        
+    - name: ⚙️ Build Executable with cx_Freeze
+      run: python setup.py build
+      
+    - name: 🚀 Create GitHub Release and Attach EXE
+      uses: softprops/action-gh-release@v1
+      with:
+        # 🚨 CHANGE 2: Use the newly generated tag for the release name
+        tag_name: ${{ steps.generate_tag.outputs.NEW_TAG }}
+        name: Automated Build ${{ steps.generate_tag.outputs.NEW_TAG }}
+        files: build/exe.*/Migration Tool.exe
+        body: |
+          Automated build triggered by push to main.
+          
+          Commit: ${{ github.sha }}
+          
+          Download the attached 'Migration Tool.exe' binary.
