@@ -7,6 +7,9 @@ on:
   push:
     branches:
       - main 
+    # 🚨 CHANGE 2: Filter the trigger to run only if newgui.py is modified
+    paths:
+      - 'newgui.py'
 
 jobs:
   build_release:
