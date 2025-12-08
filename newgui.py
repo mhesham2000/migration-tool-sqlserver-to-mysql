@@ -539,7 +539,7 @@ class MigrationThread(QThread):
         finally:
             self.finished_signal.emit()
             
-    def backoff_sleep(self, attempt, base=15, cap=241):
+    def backoff_sleep(self, attempt, base=15, cap=240):
         wait = min(base * (2 ** attempt), cap)
         self.log_signal.emit(f"Backoff sleeping for {wait} seconds...")
         self.sleep(wait)
