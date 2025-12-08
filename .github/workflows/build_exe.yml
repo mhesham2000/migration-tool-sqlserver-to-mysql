@@ -24,13 +24,18 @@ jobs:
     # 🚨 NEW STEP: Generate a unique tag based on commit hash and date
     - name: 🏷️ Generate Version Tag
       id: generate_tag
+      # 🚨 ADD THIS LINE
+      shell: bash 
       run: |
         # Get short commit SHA
+        # Note: Use github.sha directly instead of hardcoding the hash
         SHA=$(git rev-parse --short ${{ github.sha }})
         # Get current date in YYYYMMDD format
         DATE=$(date +%Y%m%d)
         # Create a build tag (e.g., build-20251208-abcdefg)
         NEW_TAG="build-${DATE}-${SHA}"
+        
+        # Use the correct Bash syntax to set output variables
         echo "NEW_TAG=$NEW_TAG" >> $GITHUB_OUTPUT
         
         # Create and push the tag immediately so the release action can find it
