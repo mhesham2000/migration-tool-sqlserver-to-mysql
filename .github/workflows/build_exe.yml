@@ -1,13 +1,12 @@
 # .github/workflows/build_exe.yml
 
-name: Build and Release Windows Executable (Push to Main)
+name: Build and Release Windows Executable (Targeted Push)
 
 on:
-  # 🚨 CHANGE 1: Trigger on every push to the 'main' branch
+  # Trigger only on push to 'main' and only if newgui.py is modified
   push:
     branches:
       - main 
-    # 🚨 CHANGE 2: Filter the trigger to run only if newgui.py is modified
     paths:
       - 'newgui.py'
 
@@ -20,28 +19,23 @@ jobs:
     steps:
     - name: ⬇️ Checkout Code
       uses: actions/checkout@v4
-      # Fetch all history and tags (crucial for accurate SHA)
       with:
         fetch-depth: 0 
 
-    # 🚨 NEW STEP: Generate a unique tag based on commit hash and date
     - name: 🏷️ Generate Version Tag
       id: generate_tag
-      # 🚨 ADD THIS LINE
+      # 🚨 Use Bash shell for Git commands
       shell: bash 
       run: |
         # Get short commit SHA
-        # Note: Use github.sha directly instead of hardcoding the hash
         SHA=$(git rev-parse --short ${{ github.sha }})
         # Get current date in YYYYMMDD format
         DATE=$(date +%Y%m%d)
-        # Create a build tag (e.g., build-20251208-abcdefg)
         NEW_TAG="build-${DATE}-${SHA}"
         
-        # Use the correct Bash syntax to set output variables
         echo "NEW_TAG=$NEW_TAG" >> $GITHUB_OUTPUT
         
-        # Create and push the tag immediately so the release action can find it
+        # Create and push the tag immediately 
         git tag $NEW_TAG
         git push origin $NEW_TAG
 
@@ -56,18 +50,29 @@ jobs:
         pip install cx_Freeze pyodbc mysql-connector-python PyQt5
         
     - name: ⚙️ Build Executable with cx_Freeze
+      # This builds the complete output folder (e.g., build/exe.win-amd64-3.11/)
       run: python setup.py build
       
-    - name: 🚀 Create GitHub Release and Attach EXE
+    # 🚨 FIX STEP 1: Compress the entire output directory into a single ZIP file.
+    # We use PowerShell's built-in Compress-Archive command here.
+    - name: 🗜️ Zip Complete Build Folder
+      shell: powershell
+      run: |
+        $TAG = "${{ steps.generate_tag.outputs.NEW_TAG }}"
+        $ZipFileName = "Migration_Tool_${TAG}.zip"
+        # Compress the ENTIRE contents of the build/exe.* directory
+        Compress-Archive -Path "build/exe.*/*" -DestinationPath $ZipFileName
+
+    - name: 🚀 Create GitHub Release and Attach ZIP
       uses: softprops/action-gh-release@v1
       with:
-        # 🚨 CHANGE 2: Use the newly generated tag for the release name
         tag_name: ${{ steps.generate_tag.outputs.NEW_TAG }}
         name: Automated Build ${{ steps.generate_tag.outputs.NEW_TAG }}
-        files: build/exe.*/Migration Tool.exe
+        # 🚨 FIX STEP 2: Attach the ZIP file, which contains the complete 50MB bundle.
+        files: Migration_Tool_${{ steps.generate_tag.outputs.NEW_TAG }}.zip
         body: |
-          Automated build triggered by push to main.
+          Automated build triggered by push to main that modified newgui.py.
+          
+          **IMPORTANT:** Download the attached ZIP file, extract it, and run the EXE inside.
           
           Commit: ${{ github.sha }}
-          
-          Download the attached 'Migration Tool.exe' binary.
