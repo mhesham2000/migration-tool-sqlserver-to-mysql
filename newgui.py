@@ -200,20 +200,36 @@ def create_mysql_table_if_not_exists(mysql_cursor, mysql_conn, sql_cursor, sql_s
         logger.log(f"CDC already enabled or failed for table {table}: {e}")
 
 def do_full_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, pk_cols, last_pk, thread):
-    chunk_size = 100
+    # 1. زيادة حجم الدفعة لزيادة السرعة
+    chunk_size = 2000
+
     applied_changes = 0
 
-
-    #1111
     # Get total count for full load progress
     sql_cursor.execute(f"SELECT COUNT(*) FROM {table}")
     total_rows = sql_cursor.fetchone()[0]
     thread.set_progress_range_signal.emit(0, total_rows)
 
-    while True:
+    # 2. تجهيز جملة SQL مرة واحدة خارج الحلقة (Optimization)
+    placeholders = ','.join(['%s'] * len(col_names))
+    update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
+    
+    # التعامل مع حالة الجداول التي تحتوي على Primary Key فقط (لا يوجد أعمدة للتحديث)
+    if update_clause:
+        insert_sql = (
+            f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in col_names)}) "
+            f"VALUES ({placeholders}) "
+            f"ON DUPLICATE KEY UPDATE {update_clause}"
+        )
+    else:
+         insert_sql = (
+            f"INSERT IGNORE INTO `{table}` ({', '.join(f'`{c}`' for c in col_names)}) "
+            f"VALUES ({placeholders}) "
+        )
 
-        #2222
-        if not thread.running: # Check the stop flag before fetching data
+    while True:
+        # Check stop flag
+        if not thread.running: 
             break
 
         if last_pk is None:
@@ -228,70 +244,75 @@ def do_full_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, pk_cols
         if not rows:
             break
 
+        # 3. تجهيز البيانات في قائمة (List of Tuples) للدفعات
+        batch_data = []
+        last_row_obj = None
+
         for row in rows:
+            if not thread.running: break
+            
+            # تحويل القيم (Decimal, Date, etc.)
+            row_values = tuple(convert_value(getattr(row, col)) for col in col_names if hasattr(row, col))
+            batch_data.append(row_values)
+            last_row_obj = row
 
-            #2222
-            if not thread.running: # Check the stop flag for each row
-                break
-
-            row_dict = {col: convert_value(getattr(row, col)) for col in col_names if hasattr(row, col)}
-            placeholders = ','.join(['%s'] * len(col_names))
-            update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
-            insert_sql = (
-                f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in col_names)}) "
-                f"VALUES ({placeholders}) "
-                f"ON DUPLICATE KEY UPDATE {update_clause}"
-            )
-            mysql_cursor.execute(insert_sql, tuple(row_dict[c] for c in col_names))
-            applied_changes += 1
-            #1111
-            thread.progress_signal.emit(applied_changes)
-
-            logger.log(f"Table {table} Insert row with PK={row_dict[pk_cols[0]]} to MySQL")
-
-        #2222            
-        if not thread.running:
+        if not batch_data:
             break
 
-        last_pk = getattr(rows[-1], pk_cols[0])
-        mysql_cursor.execute(
-            "UPDATE `migration_log` SET `last_pk`=%s WHERE `table_name`=%s",
-            (last_pk, table)
-        )
-        mysql_conn.commit()
-        logger.log(f"{applied_changes} rows migrated so far...")
+        # 4. تنفيذ الدفعة كاملة (Batch Execution)
+        try:
+            mysql_cursor.executemany(insert_sql, batch_data)
+            mysql_conn.commit() # Commit after each batch
+        except Exception as e:
+            logger.log(f"Error executing batch for table {table}: {e}")
+            # في حالة الخطأ، يمكن هنا إضافة منطق للمحاولة مرة أخرى أو التوقف
+            thread.error_signal.emit(f"Batch Error: {e}")
+            break
 
-    #2222
-    if thread.running: # Only update log and complete if the thread wasn't stopped
+        # تحديث العدادات
+        batch_len = len(batch_data)
+        applied_changes += batch_len
+        
+        # 5. تحديث الواجهة مرة واحدة فقط لكل دفعة (توفيرًا للموارد)
+        thread.progress_signal.emit(applied_changes)
+
+        # تحديث السجلات وحالة آخر PK
+        if last_row_obj:
+            last_pk = getattr(last_row_obj, pk_cols[0])
+            mysql_cursor.execute(
+                "UPDATE `migration_log` SET `last_pk`=%s WHERE `table_name`=%s",
+                (last_pk, table)
+            )
+            mysql_conn.commit()
+            
+            # لوغ مختصر لكل دفعة بدلاً من كل صف
+            logger.log(f"Table {table}: Migrated batch of {batch_len} rows. Total: {applied_changes}")
+
+    # Finalize
+    if thread.running: 
         mysql_cursor.execute(
             "UPDATE `migration_log` SET `full_load_done`=1 WHERE `table_name`=%s",
             (table,)
         )
         mysql_conn.commit()
-        logger.log(f"Table {table} full load applied. Total rows migrated: {applied_changes}")
+        logger.log(f"Table {table} full load COMPLETED. Total rows migrated: {applied_changes}")
 
-    # mysql_cursor.execute(
-    #     "UPDATE `migration_log` SET `full_load_done`=1 WHERE `table_name`=%s",
-    #     (table,)
-    # )
-    # mysql_conn.commit()
-    # logger.log(f"Table {table} full load applied. Total rows migrated: {applied_changes}")
-    
-    #1111
     # Ensure progress bar reaches 100%
     thread.progress_signal.emit(total_rows)
 
 def do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, pk_cols, thread):
+    # 1. التحقق من تفعيل CDC
     sql_cursor.execute(
         f"SELECT capture_instance FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('{table}')"
     )
     result = sql_cursor.fetchall()
     if not result:
-        logger.log(f"CDC not enabled for table {table}. Skipping incremental...")
+        # logger.log(f"CDC not enabled for table {table}. Skipping incremental...")
         return False
 
     capture_instance = result[0][0]
 
+    # 2. الحصول على LSNs
     sql_cursor.execute("SELECT sys.fn_cdc_get_max_lsn()")
     max_lsn = sql_cursor.fetchone()[0]
 
@@ -309,55 +330,111 @@ def do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, 
         return False
 
     if last_lsn == max_lsn:
-        logger.log(f"No new changes for {table}, skipping this cycle.")
+        # لا توجد تغييرات جديدة
         return False
 
+    # 3. جلب التغييرات
     cdc_query = f"SELECT * FROM cdc.fn_cdc_get_all_changes_{capture_instance}(?, ?, ?)"
-    sql_cursor.execute(cdc_query, (last_lsn, max_lsn, 'all'))
-    # rows = sql_cursor.fetchall()
+    try:
+        sql_cursor.execute(cdc_query, (last_lsn, max_lsn, 'all'))
+        rows = sql_cursor.fetchall()
+    except Exception as e:
+        # أحياناً يكون LSN القديم قد تم حذفه من SQL Server (Cleaned up)
+        logger.log(f"CDC Error (LSN mismatch?): {e}. Reseting LSN to current max.")
+        mysql_cursor.execute("UPDATE `migration_log` SET `last_lsn`=%s WHERE `table_name`=%s", (max_lsn, table))
+        mysql_conn.commit()
+        return False
 
-    #1111
-    rows = sql_cursor.fetchall()
     total_changes = len(rows)
     thread.set_progress_range_signal.emit(0, total_changes)
 
     if not rows:
-        return False
+        return False # No rows returned
 
-    applied_inserts = applied_updates = applied_deletes = 0
+    # 4. تحضير جمل SQL
+    placeholders = ','.join(['%s'] * len(col_names))
+    update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
+    
+    # جملة الإضافة/التعديل
+    upsert_sql = (
+        f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in col_names)}) "
+        f"VALUES ({placeholders}) "
+        f"ON DUPLICATE KEY UPDATE {update_clause}"
+    )
+    
+    # جملة الحذف
+    where_clause = ' AND '.join([f"`{col}`=%s" for col in pk_cols])
+    delete_sql = f"DELETE FROM `{table}` WHERE {where_clause}"
+
+    # 5. معالجة الدفعات بذكاء (Smart Batching)
+    upsert_batch = []
+    delete_batch = []
+    processed_count = 0
+
+    def flush_upserts():
+        if upsert_batch:
+            try:
+                mysql_cursor.executemany(upsert_sql, upsert_batch)
+                upsert_batch.clear()
+            except Exception as e:
+                logger.log(f"Error executing upsert batch: {e}")
+
+    def flush_deletes():
+        if delete_batch:
+            try:
+                mysql_cursor.executemany(delete_sql, delete_batch)
+                delete_batch.clear()
+            except Exception as e:
+                logger.log(f"Error executing delete batch: {e}")
+
     for i, row in enumerate(rows):
-        row_dict = {col: convert_value(getattr(row, col)) for col in col_names if hasattr(row, col)}
+        if not thread.running: break
+
         operation = getattr(row, '__$operation', 2)
+        
+        # تحويل البيانات
+        row_dict = {col: convert_value(getattr(row, col)) for col in col_names if hasattr(row, col)}
 
-        if operation == 1:  # delete
-            where_clause = ' AND '.join([f"`{col}`=%s" for col in pk_cols])
-            delete_query = f"DELETE FROM `{table}` WHERE {where_clause}"
-            mysql_cursor.execute(delete_query, tuple(row_dict[col] for col in pk_cols))
-            applied_deletes += 1
-            logger.log(f"{table}: Deleted row {tuple(row_dict[col] for col in pk_cols)}")
-        else:  # insert or update
-            placeholders = ','.join(['%s'] * len(col_names))
-            update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
-            insert_sql = (
-                f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in col_names)}) "
-                f"VALUES ({placeholders}) "
-                f"ON DUPLICATE KEY UPDATE {update_clause}"
-            )
-            mysql_cursor.execute(insert_sql, tuple(row_dict[c] for c in col_names))
+        if operation == 1:  # Delete
+            # يجب تنفيذ أي إضافات معلقة أولاً للحفاظ على الترتيب
+            flush_upserts()
+            
+            # تجهيز مفاتيح الحذف
+            pk_values = tuple(row_dict[col] for col in pk_cols)
+            delete_batch.append(pk_values)
+            
+        else:  # Insert (2) or Update (4)
+            # يجب تنفيذ أي حذوفات معلقة أولاً
+            flush_deletes()
+            
+            # تجهيز بيانات الصف
+            row_values = tuple(row_dict[c] for c in col_names)
+            upsert_batch.append(row_values)
 
-            if operation == 2:
-                applied_inserts += 1
-                logger.log(f"Table {table} Insert row with PK={row_dict[pk_cols[0]]}")
-            else:
-                applied_updates += 1
-                logger.log(f"Table {table} Update row with PK={row_dict[pk_cols[0]]}")
+        processed_count += 1
+        
+        # تنفيذ الدفعات عند الوصول لحجم معين (مثلاً كل 1000 صف) لتفادي استهلاك الذاكرة
+        if len(upsert_batch) >= 1:
+            flush_upserts()
+            thread.progress_signal.emit(processed_count)
+            logger.log(f"{table} Incremental: Processed {processed_count} changes so far (Batch Mode).")
 
-        #1111
-        thread.progress_signal.emit(i + 1)
+            mysql_conn.commit()
+            
+        if len(delete_batch) >= 1:
+            flush_deletes()
+            thread.progress_signal.emit(processed_count)
+            mysql_conn.commit()
 
+    # تنفيذ المتبقي
+    flush_upserts()
+    flush_deletes()
     mysql_conn.commit()
-    logger.log(f"{table} incremental applied. Inserts/Updates/Deletes: {applied_inserts}/{applied_updates}/{applied_deletes}")
 
+    if processed_count > 0:
+        logger.log(f"{table} Incremental: Processed {processed_count} changes (Batch Mode).")
+
+    # تحديث LSN في النهاية
     mysql_cursor.execute("""
         INSERT INTO `migration_log` (`table_name`, `last_lsn`)
         VALUES (%s, %s)
@@ -365,10 +442,8 @@ def do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, 
     """, (table, max_lsn, max_lsn))
     mysql_conn.commit()
 
-    #1111
     thread.progress_signal.emit(total_changes)
-
-    return True # ✅ changes applied
+    return True
 
 def migrate_table(sql_cursor, mysql_cursor, mysql_conn, sql_server_conn, table, config):
     logger.log(f"Starting migration for table {table}...")
@@ -1797,193 +1872,263 @@ class MigrationGUI(QMainWindow):
             self.config_text.setPlainText(f"Error loading config.json: {e}")
 
     def get_row_counts(self):
-        self.row_counts_table.setRowCount(0) # Clear existing data
-        self.log("Counting rows...")
-        
-        try:
-            config = load_config()
-            sql_server = config.get("sql_server")
-            source_db = config.get("source_db")
-            mysql_host = config.get("mysql_host")
-            mysql_user = config.get("mysql_user")
-            mysql_pass = config.get("mysql_password")
-            mysql_db = config.get("mysql_db_name")
-            tables = [t.strip() for t in config.get("tables", "").split(",") if t.strip()]
-
-            if not all([sql_server, source_db, mysql_host, mysql_user, mysql_pass, mysql_db]):
-                QMessageBox.warning(self, "Error", "Please complete all connection settings in the Config tab.")
-                return
-
-            sql_conn = connect_sql_server(sql_server, source_db)
-            sql_cursor = sql_conn.cursor()
-
-            mysql_conn = mysql.connector.connect(
-                host=mysql_host,
-                user=mysql_user,
-                password=mysql_pass,
-                database=mysql_db
-            )
-            mysql_cursor = mysql_conn.cursor()
+            self.row_counts_table.setRowCount(0) # Clear existing data
+            self.log("Counting rows...")
             
-            self.log("Connection successful. Getting counts...")
-            
-            self.row_counts_table.setRowCount(len(tables))
-            
-            for i, table in enumerate(tables):
-                self.log(f"Counting rows for table: {table}")
+            try:
+                config = load_config()
+                sql_server = config.get("sql_server")
+                source_db = config.get("source_db")
+                mysql_host = config.get("mysql_host")
+                mysql_user = config.get("mysql_user")
+                mysql_pass = config.get("mysql_password")
+                mysql_db = config.get("mysql_db_name")
+                tables = [t.strip() for t in config.get("tables", "").split(",") if t.strip()]
 
-                # SQL Server count
-                sql_cursor.execute(f"SELECT COUNT(*) FROM {table}")
-                sql_count = sql_cursor.fetchone()[0]
+                if not all([sql_server, source_db, mysql_host, mysql_user, mysql_pass, mysql_db]):
+                    QMessageBox.warning(self, "Error", "Please complete all connection settings in the Config tab.")
+                    return
 
-                # MySQL count
-                mysql_cursor.execute(f"SELECT COUNT(*) FROM {table}")
-                mysql_count = mysql_cursor.fetchone()[0]
+                sql_conn = connect_sql_server(sql_server, source_db)
+                sql_cursor = sql_conn.cursor()
 
-                difference = abs(sql_count - mysql_count)
+                mysql_conn = mysql.connector.connect(
+                    host=mysql_host,
+                    user=mysql_user,
+                    password=mysql_pass,
+                    database=mysql_db
+                )
+                mysql_cursor = mysql_conn.cursor()
+                
+                self.log("Connection successful. Getting counts...")
+                
+                # --- تعديل 1: زيادة عدد الأعمدة إلى 6 ---
+                self.row_counts_table.setColumnCount(6)
+                self.row_counts_table.setHorizontalHeaderLabels(["Table Name", "SQL Server Count", "MySQL Count", "Difference", "Sync", "Reset Log"])
+                
+                header = self.row_counts_table.horizontalHeader()
+                header.setSectionResizeMode(0, QHeaderView.Stretch)
+                # ضبط أحجام باقي الأعمدة لتكون مناسبة للمحتوى
+                for k in range(1, 6):
+                    header.setSectionResizeMode(k, QHeaderView.ResizeToContents)
 
-                # Populate the table widget
-                self.row_counts_table.setItem(i, 0, QTableWidgetItem(table))
-                self.row_counts_table.setItem(i, 1, QTableWidgetItem(f"{sql_count:,}"))
-                self.row_counts_table.setItem(i, 2, QTableWidgetItem(f"{mysql_count:,}"))
+                self.row_counts_table.setRowCount(len(tables))
+                
+                for i, table in enumerate(tables):
+                    # SQL Server count
+                    sql_cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                    sql_count = sql_cursor.fetchone()[0]
 
-                # Create QTableWidgetItem for the difference
-                diff_item = QTableWidgetItem(f"{difference:,}")
+                    # MySQL count
+                    mysql_cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                    mysql_count = mysql_cursor.fetchone()[0]
 
-                if difference > 0:
-                    # Set the text color to red
-                    diff_item.setForeground(QBrush(QColor("red")))
+                    difference = abs(sql_count - mysql_count)
 
-                    # Create and set the Sync button
-                    sync_button = QPushButton("Sync")
-                    sync_button.clicked.connect(lambda _, t=table: self.sync_rows_by_pk(t))
-                    self.row_counts_table.setCellWidget(i, 4, sync_button)
+                    # Populate the table widget
+                    self.row_counts_table.setItem(i, 0, QTableWidgetItem(table))
+                    self.row_counts_table.setItem(i, 1, QTableWidgetItem(f"{sql_count:,}"))
+                    self.row_counts_table.setItem(i, 2, QTableWidgetItem(f"{mysql_count:,}"))
 
-                # Set the difference item in the table
-                self.row_counts_table.setItem(i, 3, diff_item)
+                    # Difference Item
+                    diff_item = QTableWidgetItem(f"{difference:,}")
+                    if difference > 0:
+                        diff_item.setForeground(QBrush(QColor("red")))
+                        # Sync Button (Column 4)
+                        sync_button = QPushButton("Sync")
+                        sync_button.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+                        sync_button.clicked.connect(lambda _, t=table: self.sync_rows_by_pk(t))
+                        self.row_counts_table.setCellWidget(i, 4, sync_button)
+                    
+                    self.row_counts_table.setItem(i, 3, diff_item)
 
-            sql_conn.close()
-            mysql_conn.close()
+                    # --- تعديل 2: إضافة زر Reset Log (Column 5) ---
+                    reset_btn = QPushButton("Reset Log")
+                    reset_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;") # لون أحمر
+                    # نستخدم lambda لتمرير اسم الجدول عند الضغط
+                    reset_btn.clicked.connect(lambda _, t=table: self.reset_migration_log(t))
+                    self.row_counts_table.setCellWidget(i, 5, reset_btn)
 
-            self.log("Row counts retrieved successfully.")
-            QMessageBox.information(self, "Success", "Row counts updated successfully.")
+                sql_conn.close()
+                mysql_conn.close()
 
+                self.log("Row counts updated successfully.")
+                # QMessageBox.information(self, "Success", "Row counts updated successfully.")
 
-        except Exception as e:
-            self.row_counts_table.setRowCount(0) # Clear table on error
-            QMessageBox.critical(self, "Error", f"An error occurred: {e}")
+            except Exception as e:
+                self.row_counts_table.setRowCount(0) # Clear table on error
+                QMessageBox.critical(self, "Error", f"An error occurred: {e}")
 
 
     def sync_rows_by_pk(self, table_name):
-        self.log(f"Starting re-sync for table: {table_name}")
-        self.progress_bar.setVisible(True)
-        try:
-            config = load_config()
-            sql_server = config.get("sql_server")
-            source_db = config.get("source_db")
-            mysql_host = config.get("mysql_host")
-            mysql_user = config.get("mysql_user")
-            mysql_pass = config.get("mysql_password")
-            mysql_db = config.get("mysql_db_name")
+            self.log(f"Starting re-sync for table: {table_name}")
+            self.progress_bar.setVisible(True)
+            try:
+                config = load_config()
+                sql_server = config.get("sql_server")
+                source_db = config.get("source_db")
+                mysql_host = config.get("mysql_host")
+                mysql_user = config.get("mysql_user")
+                mysql_pass = config.get("mysql_password")
+                mysql_db = config.get("mysql_db_name")
 
-            sql_conn = connect_sql_server(sql_server, source_db)
-            sql_cursor = sql_conn.cursor()
-            mysql_conn, mysql_cursor = connect_mysql(mysql_db, mysql_host, mysql_user, mysql_pass)
+                sql_conn = connect_sql_server(sql_server, source_db)
+                sql_cursor = sql_conn.cursor()
+                mysql_conn, mysql_cursor = connect_mysql(mysql_db, mysql_host, mysql_user, mysql_pass)
 
-            # Get the primary key column name
-            pk_cols = get_primary_keys(sql_cursor, table_name, [])
-            if not pk_cols:
-                QMessageBox.warning(self, "Error", f"No primary key found for table {table_name}.")
-                return
-            pk_col = pk_cols[0]
+                # Get the primary key column name
+                pk_cols = get_primary_keys(sql_cursor, table_name, [])
+                if not pk_cols:
+                    QMessageBox.warning(self, "Error", f"No primary key found for table {table_name}.")
+                    return
+                pk_col = pk_cols[0]
 
-            # Get all primary keys from SQL Server
-            sql_cursor.execute(f"SELECT [{pk_col}] FROM {table_name}")
-            sql_pks = {row[0] for row in sql_cursor.fetchall()}
+                self.log("Fetching Primary Keys from SQL Server...")
+                sql_cursor.execute(f"SELECT [{pk_col}] FROM {table_name}")
+                sql_pks = {row[0] for row in sql_cursor.fetchall()}
 
-            # Get all primary keys from MySQL
-            mysql_cursor.execute(f"SELECT `{pk_col}` FROM `{table_name}`")
-            mysql_pks = {row[0] for row in mysql_cursor.fetchall()}
+                self.log("Fetching Primary Keys from MySQL...")
+                mysql_cursor.execute(f"SELECT `{pk_col}` FROM `{table_name}`")
+                mysql_pks = {row[0] for row in mysql_cursor.fetchall()}
 
-            # Find PKs that are in SQL Server but not in MySQL (inserts)
-            pks_to_insert = list(sql_pks - mysql_pks)
-            # Find PKs that are in MySQL but not in SQL Server (deletes)
-            pks_to_delete = list(mysql_pks - sql_pks)
+                # Find differences
+                pks_to_insert = list(sql_pks - mysql_pks)
+                pks_to_delete = list(mysql_pks - sql_pks)
 
-            #1111
-            total_rows_to_sync = len(pks_to_insert) + len(pks_to_delete)
-            self.progress_bar.setMinimum(0)
-            self.progress_bar.setMaximum(total_rows_to_sync)
-            current_progress = 0
+                total_rows_to_sync = len(pks_to_insert) + len(pks_to_delete)
+                self.progress_bar.setMinimum(0)
+                self.progress_bar.setMaximum(total_rows_to_sync)
+                current_progress = 0
 
-            # Handle inserts/updates
-            if pks_to_insert:
-                self.log(f"Found {len(pks_to_insert)} rows to insert/update...")
-                # Fetch rows from SQL Server in chunks to avoid memory issues
-                chunk_size = 50
-                for i in range(0, len(pks_to_insert), chunk_size):
-                    chunk = pks_to_insert[i:i + chunk_size]
-                    placeholders = ','.join(['?'] * len(chunk))
-                    sql_cursor.execute(f"SELECT * FROM {table_name} WHERE [{pk_col}] IN ({placeholders})", chunk)
-                    rows_to_sync = sql_cursor.fetchall()
-
-                    # Get column names for insertion
+                # ---------------------------
+                # 1. Handle Inserts / Updates (Batch Optimized)
+                # ---------------------------
+                if pks_to_insert:
+                    self.log(f"Found {len(pks_to_insert)} rows to insert/update...")
+                    
+                    # رفع حجم الدفعة لتسريع العمليات
+                    chunk_size = 1000 
+                    
+                    # تحضير جملة الـ Insert مرة واحدة
                     sql_cursor.execute(f"SELECT TOP 0 * FROM {table_name}")
                     col_names = [col[0] for col in sql_cursor.description]
+                    
                     placeholders_mysql = ','.join(['%s'] * len(col_names))
                     update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
-                    insert_sql = (
-                        f"INSERT INTO `{table_name}` ({', '.join(f'`{c}`' for c in col_names)}) "
-                        f"VALUES ({placeholders_mysql}) "
-                        f"ON DUPLICATE KEY UPDATE {update_clause}"
-                    )
+                    
+                    # استخدام INSERT IGNORE إذا لم يكن هناك تحديث، أو ON DUPLICATE KEY UPDATE
+                    if update_clause:
+                        insert_sql = (
+                            f"INSERT INTO `{table_name}` ({', '.join(f'`{c}`' for c in col_names)}) "
+                            f"VALUES ({placeholders_mysql}) "
+                            f"ON DUPLICATE KEY UPDATE {update_clause}"
+                        )
+                    else:
+                        insert_sql = (
+                            f"INSERT IGNORE INTO `{table_name}` ({', '.join(f'`{c}`' for c in col_names)}) "
+                            f"VALUES ({placeholders_mysql})"
+                        )
 
-                    for row in rows_to_sync:
-                        row_data = tuple(convert_value(getattr(row, col)) for col in col_names if hasattr(row, col))
-                        mysql_cursor.execute(insert_sql, row_data)
-                        self.log(f"Synced row with PK={row_data[0]}")
+                    for i in range(0, len(pks_to_insert), chunk_size):
+                        # تحديث الواجهة للسماح بإلغاء العملية وعدم تعليق البرنامج
+                        QApplication.processEvents()
                         
-                        #1111
-                        current_progress += 1
+                        chunk = pks_to_insert[i:i + chunk_size]
+                        
+                        # جلب البيانات من SQL Server
+                        placeholders = ','.join(['?'] * len(chunk))
+                        sql_query = f"SELECT * FROM {table_name} WHERE [{pk_col}] IN ({placeholders})"
+                        sql_cursor.execute(sql_query, chunk)
+                        rows_to_sync = sql_cursor.fetchall()
+
+                        # تحضير البيانات للـ Batch Insert
+                        batch_data = []
+                        for row in rows_to_sync:
+                            row_data = tuple(convert_value(getattr(row, col)) for col in col_names if hasattr(row, col))
+                            batch_data.append(row_data)
+
+                        # تنفيذ الإدراج دفعة واحدة (Huge Performance Boost)
+                        if batch_data:
+                            try:
+                                mysql_cursor.executemany(insert_sql, batch_data)
+                                mysql_conn.commit()
+                            except Exception as e:
+                                self.log(f"Error in sync batch insert: {e}")
+
+                        # تحديث شريط التقدم
+                        current_progress += len(chunk)
+                        self.progress_bar.setValue(current_progress)
+                        self.log(f"Synced batch of {len(chunk)} rows (Total: {current_progress}/{total_rows_to_sync})")
+                    
+                # ---------------------------
+                # 2. Handle Deletes (Batch Optimized)
+                # ---------------------------
+                if pks_to_delete:
+                    self.log(f"Found {len(pks_to_delete)} rows to delete...")
+                    
+                    chunk_size = 1000
+                    
+                    for i in range(0, len(pks_to_delete), chunk_size):
+                        QApplication.processEvents()
+
+                        chunk = pks_to_delete[i:i + chunk_size]
+                        placeholders_mysql = ','.join(['%s'] * len(chunk))
+                        delete_sql = f"DELETE FROM `{table_name}` WHERE `{pk_col}` IN ({placeholders_mysql})"
+                        
+                        try:
+                            mysql_cursor.execute(delete_sql, chunk)
+                            mysql_conn.commit()
+                        except Exception as e:
+                            self.log(f"Error in sync batch delete: {e}")
+                            
+                        current_progress += len(chunk)
                         self.progress_bar.setValue(current_progress)
 
-                    mysql_conn.commit()
+                sql_conn.close()
+                mysql_conn.close()
                 
-            # Handle deletes
-            if pks_to_delete:
-                self.log(f"Found {len(pks_to_delete)} rows to delete...")
-                # Delete from MySQL in chunks
-                chunk_size = 50
-                for i in range(0, len(pks_to_delete), chunk_size):
-                    chunk = pks_to_delete[i:i + chunk_size]
-                    placeholders_mysql = ','.join(['%s'] * len(chunk))
-                    delete_sql = f"DELETE FROM `{table_name}` WHERE `{pk_col}` IN ({placeholders_mysql})"
-                    mysql_cursor.execute(delete_sql, chunk)
-                mysql_conn.commit()
-                self.log(f"Deleted {len(pks_to_delete)} rows from MySQL.")
+                self.log(f"Re-sync for {table_name} completed successfully.")
+                QMessageBox.information(self, "Success", f"Re-sync for {table_name} completed.")
+                self.get_row_counts() # Refresh the table
+                
+                self.progress_bar.setValue(total_rows_to_sync)
+                self.progress_bar.setVisible(False)
 
-                #1111
-                current_progress += len(pks_to_delete)
-                self.progress_bar.setValue(current_progress)
+            except Exception as e:
+                self.log(f"Error during re-sync: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to re-sync table {table_name}: {e}")
+                self.progress_bar.setVisible(False)
 
-            sql_conn.close()
-            mysql_conn.close()
-            
-            self.log(f"Re-sync for {table_name} completed successfully.")
-            QMessageBox.information(self, "Success", f"Re-sync for {table_name} completed.")
-            self.get_row_counts() # Refresh the table
-            
-            #1111
-            self.progress_bar.setValue(total_rows_to_sync)
-            self.progress_bar.setVisible(False)
 
-        except Exception as e:
-            self.log(f"Error during re-sync: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to re-sync table {table_name}: {e}")
-            
-            #1111
-            self.progress_bar.setVisible(False)
+    def reset_migration_log(self, table_name):
+            # تأكيد الحذف من المستخدم أولاً
+            reply = QMessageBox.question(self, 'Confirm Reset', 
+                                        f"Are you sure you want to delete the migration log for table '{table_name}'?\n\n"
+                                        "This will force the tool to restart migration from the beginning (Full Load) for this table next time you start.",
+                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
 
+            if reply == QMessageBox.Yes:
+                try:
+                    config = load_config()
+                    mysql_conn, mysql_cursor = connect_mysql(
+                        config.get("mysql_db_name"),
+                        config.get("mysql_host"),
+                        config.get("mysql_user"),
+                        config.get("mysql_password")
+                    )
+                    
+                    if mysql_conn:
+                        # تنفيذ الحذف
+                        mysql_cursor.execute("DELETE FROM migration_log WHERE table_name = %s", (table_name,))
+                        mysql_conn.commit()
+                        
+                        self.log(f"Migration log reset for table: {table_name}")
+                        QMessageBox.information(self, "Success", f"Log cleared for {table_name}. You can now restart migration to perform a fresh Full Load.")
+                        
+                        mysql_conn.close()
+                except Exception as e:
+                    self.log(f"Error resetting log for {table_name}: {e}")
+                    QMessageBox.critical(self, "Error", f"Failed to reset log: {e}")
 
 
 def main():
