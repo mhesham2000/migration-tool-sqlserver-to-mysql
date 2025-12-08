@@ -2,9 +2,15 @@
 
 A robust, GUI-based ETL application written in Python (PyQt5) designed to migrate data from Microsoft SQL Server to MySQL in real-time. This tool handles both the initial full load of data and continuous incremental updates using SQL Server's Change Data Capture (CDC) mechanism.
 
-[![Latest Release](https://img.shields.io/github/v/release/mhesham2000/migration-tool-sqlserver-to-mysql)](https://github.com/mhesham2000/migration-tool-sqlserver-to-mysql/releases/latest)
+## ⬇️ Download
 
-<img width="1198" height="835" alt="Image" src="https://github.com/user-attachments/assets/66c4a821-bb0b-4e00-a0e3-70e340cc7665" />
+For most devices, it is recommended to install the **arm64-v8a** version of the apks
+
+- Download the latest stable version from [GitHub releases](https://github.com/mhesham2000/migration-tool-sqlserver-to-mysql/releases/latest)
+  - Install the [pre-release](https://github.com/mhesham2000/migration-tool-sqlserver-to-mysql/releases/) versions to help us test out new features & changes
+
+
+<img width="1198" height="835" alt="Image" src="https://github.com/user-attachments/assets/5f39c4e7-8930-442b-ae96-878540588d39" />
 
 ## 🚀 Features
 
@@ -55,7 +61,7 @@ Configure your destination MySQL credentials on the right panel. The tool will a
 ### 2. Monitoring Process
 Once started, switch to the **Log** tab to watch the migration in real-time. You will see detailed logs of inserted rows, primary keys processing, and any connection retries.
 
-<img width="1204" height="841" alt="Image" src="https://github.com/user-attachments/assets/7daa9cad-639a-4c98-acc1-2fdeb723ff68" />
+<img width="1204" height="841" alt="Image" src="https://github.com/user-attachments/assets/88c0abea-4d38-428c-b979-96aed37a8eed" />
 
 ## ⚙️ Administration & Tools
 
@@ -65,7 +71,7 @@ This tab allows you to manage the Change Data Capture status on the SQL Server w
 * **Activate/Deactivate CDC:** Toggles CDC on the DB and selected tables.
 * **Show CDC Table Sizes:** Displays the storage footprint of the change tables.
   
-<img width="1202" height="838" alt="Image" src="https://github.com/user-attachments/assets/34c485f4-bf83-40dd-a527-6cc362f43118" />
+<img width="1202" height="838" alt="Image" src="https://github.com/user-attachments/assets/b344b868-70ea-4d03-a071-ca160513d716" />
 
 ### Sync Tab (Data Integrity)
 Use this tab to ensure data consistency between Source and Destination.
@@ -73,7 +79,7 @@ Use this tab to ensure data consistency between Source and Destination.
 * **Sync Button:** Clicking 'Sync' on a mismatched table performs a Primary Key diff (Set Difference) to identify and fetch only the missing rows.
 
 
-<img width="1199" height="844" alt="Image" src="https://github.com/user-attachments/assets/03b351e3-3172-48c4-9c59-7105c3e6360d" />
+<img width="1199" height="844" alt="Image" src="https://github.com/user-attachments/assets/2635e74a-23d1-4c9c-8ddb-7db247a04926" />
 
 ## 📂 Configuration File
 
