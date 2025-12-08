@@ -1,0 +1,78 @@
+# .github/workflows/build_exe.yml
+
+name: Build and Release Windows Executable (Targeted Push)
+
+on:
+  # Trigger only on push to 'main' and only if newgui.py is modified
+  push:
+    branches:
+      - main 
+    paths:
+      - 'newgui.py'
+
+jobs:
+  build_release:
+    runs-on: windows-latest
+    permissions:
+      contents: write 
+
+    steps:
+    - name: ⬇️ Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 
+
+    - name: 🏷️ Generate Version Tag
+      id: generate_tag
+      # 🚨 Use Bash shell for Git commands
+      shell: bash 
+      run: |
+        # Get short commit SHA
+        SHA=$(git rev-parse --short ${{ github.sha }})
+        # Get current date in YYYYMMDD format
+        DATE=$(date +%Y%m%d)
+        NEW_TAG="build-${DATE}-${SHA}"
+        
+        echo "NEW_TAG=$NEW_TAG" >> $GITHUB_OUTPUT
+        
+        # Create and push the tag immediately 
+        git tag $NEW_TAG
+        git push origin $NEW_TAG
+
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11' 
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install cx_Freeze pyodbc mysql-connector-python PyQt5
+        
+    - name: ⚙️ Build Executable with cx_Freeze
+      # This builds the complete output folder (e.g., build/exe.win-amd64-3.11/)
+      run: python setup.py build
+      
+    # 🚨 FIX STEP 1: Compress the entire output directory into a single ZIP file.
+    # We use PowerShell's built-in Compress-Archive command here.
+    - name: 🗜️ Zip Complete Build Folder
+      shell: powershell
+      run: |
+        $TAG = "${{ steps.generate_tag.outputs.NEW_TAG }}"
+        $ZipFileName = "Migration_Tool_${TAG}.zip"
+        # Compress the ENTIRE contents of the build/exe.* directory
+        Compress-Archive -Path "build/exe.*/*" -DestinationPath $ZipFileName
+
+    - name: 🚀 Create GitHub Release and Attach ZIP
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.generate_tag.outputs.NEW_TAG }}
+        name: Automated Build ${{ steps.generate_tag.outputs.NEW_TAG }}
+        # 🚨 FIX STEP 2: Attach the ZIP file, which contains the complete 50MB bundle.
+        files: Migration_Tool_${{ steps.generate_tag.outputs.NEW_TAG }}.zip
+        body: |
+          Automated build triggered by push to main that modified newgui.py.
+          
+          **IMPORTANT:** Download the attached ZIP file, extract it, and run the EXE inside.
+          
+          Commit: ${{ github.sha }}
