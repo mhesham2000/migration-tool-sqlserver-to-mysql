@@ -875,6 +875,14 @@ class MigrationGUI(QMainWindow):
         self.auto_start_timer.timeout.connect(self.auto_start_migration)
         self.auto_start_timer.start(1000)  # Start after 1 second
 
+        # --- NEW: Periodic CDC Activation Timer ---
+        self.cdc_sync_timer = QTimer(self)
+        self.cdc_sync_timer.timeout.connect(self.run_periodic_cdc_sync)
+        # Set interval to 5 minutes (300,000 milliseconds)
+        self.cdc_sync_timer.start(5 * 60 * 1000) 
+        self.log("Started 5-minute periodic CDC sync timer.")
+        # --- END NEW ---
+
     def initTrayIcon(self):
         # 2. إنشاء أيقونة شريط المهام
         self.tray_icon = QSystemTrayIcon(self)
@@ -2097,6 +2105,31 @@ class MigrationGUI(QMainWindow):
             except Exception as e:
                 self.row_counts_table.setRowCount(0) # Clear table on error
                 QMessageBox.critical(self, "Error", f"An error occurred: {e}")
+
+
+    def run_periodic_cdc_sync(self):
+            """
+            Executes the activate_cdc logic periodically to ensure schema consistency 
+            and CDC is active on all configured tables.
+            """
+            self.log("--- Starting periodic CDC sync and schema check (5-minute interval) ---")
+            
+            try:
+                # We call the existing activate_cdc method
+                # It already contains the logic to:
+                # 1. Check MySQL connection.
+                # 2. Check current MySQL schema against config.json.
+                # 3. ALTER TABLE to add any missing columns.
+                # 4. Enable CDC on the database.
+                # 5. Enable CDC on all tables with the correct column list.
+                self.activate_cdc()
+                
+                self.log("--- Periodic CDC sync and schema check completed ---")
+
+            except Exception as e:
+                # Note: The activate_cdc function already has internal error handling (QMessageBox, log).
+                # This outer try/except is mainly for catching unexpected timer execution failures.
+                self.log(f"CRITICAL ERROR during periodic CDC sync: {e}")
 
 
     def sync_rows_by_pk(self, table_name):
