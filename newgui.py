@@ -1751,70 +1751,109 @@ class MigrationGUI(QMainWindow):
 
 
     def deactivate_cdc(self):
-        try:
-            config = load_config()
-            server = config.get("sql_server")
-            db_name = config.get("source_db")
+            try:
+                config = load_config()
+                server = config.get("sql_server")
+                db_name = config.get("source_db")
 
-            if not server or not db_name:
-                QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
-                return
+                if not server or not db_name:
+                    QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
+                    return
 
-            # connect SQL Server + MySQL
-            sql_conn = connect_sql_server(server, db_name)
-            sql_cursor = sql_conn.cursor()
+                # Connect to SQL Server
+                sql_conn = connect_sql_server(server, db_name)
+                sql_cursor = sql_conn.cursor()
 
-            mysql_conn, mysql_cursor = connect_mysql(
-                config.get("mysql_db_name"),
-                config.get("mysql_host"),
-                config.get("mysql_user"),
-                config.get("mysql_password")
-            )
+                # --- Attempt to Connect to MySQL and Check for migration_log table ---
+                mysql_conn = None
+                mysql_cursor = None
+                log_table_exists = False
+                
+                try:
+                    # connect_mysql ensures a database is created and used
+                    mysql_conn, mysql_cursor = connect_mysql(
+                        config.get("mysql_db_name"),
+                        config.get("mysql_host"),
+                        config.get("mysql_user"),
+                        config.get("mysql_password")
+                    )
+                    
+                    if mysql_conn and mysql_cursor:
+                        # Check if migration_log table exists
+                        mysql_cursor.execute("SHOW TABLES LIKE 'migration_log'")
+                        if mysql_cursor.fetchone():
+                            log_table_exists = True
+                    
+                except Exception as e:
+                    self.log(f"MySQL connection or check for migration_log failed: {e}. Proceeding with CDC disable only.")
+                    # mysql_conn remains None or closed if the error was connection-related
+                    
 
-            # loop on all tables
-            tables = [t.strip() for t in config.get("tables", "").split(",") if t.strip()]
-            for table in tables:
-                # get primary key
-                sql_cursor.execute(f"""
-                    SELECT COLUMN_NAME 
-                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                    WHERE TABLE_NAME='{table}'
-                """)
-                pk_cols = [row[0] for row in sql_cursor.fetchall()]
-                if not pk_cols:
-                    # fallback أول عمود
-                    sql_cursor.execute(f"""
-                        SELECT COLUMN_NAME 
-                        FROM INFORMATION_SCHEMA.COLUMNS
-                        WHERE TABLE_NAME='{table}' ORDER BY ORDINAL_POSITION
-                    """)
-                    pk_cols = [sql_cursor.fetchone()[0]]
+                # loop on all tables and save last_pk ONLY if MySQL log is accessible
+                if log_table_exists and mysql_conn and mysql_cursor:
+                    tables = [t.strip() for t in config.get("tables", "").split(",") if t.strip()]
+                    for table in tables:
+                        try:
+                            # get primary key
+                            sql_cursor.execute(f"""
+                                SELECT COLUMN_NAME 
+                                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                                WHERE TABLE_NAME='{table}'
+                            """)
+                            pk_cols = [row[0] for row in sql_cursor.fetchall()]
+                            
+                            if not pk_cols:
+                                # fallback to the first column
+                                sql_cursor.execute(f"""
+                                    SELECT COLUMN_NAME 
+                                    FROM INFORMATION_SCHEMA.COLUMNS
+                                    WHERE TABLE_NAME='{table}' ORDER BY ORDINAL_POSITION
+                                """)
+                                pk_cols = [sql_cursor.fetchone()[0]]
 
-                pk = pk_cols[0]
-                # get max(pk) from SQL Server table
-                sql_cursor.execute(f"SELECT MAX([{pk}]) FROM [{table}]")
-                last_pk = sql_cursor.fetchone()[0]
+                            pk = pk_cols[0]
+                            
+                            # get max(pk) from SQL Server table
+                            sql_cursor.execute(f"SELECT MAX([{pk}]) FROM [{table}]")
+                            last_pk = sql_cursor.fetchone()[0]
 
-                # update migration_log
-                mysql_cursor.execute("""
-                    INSERT INTO migration_log (table_name, last_pk, full_load_done, last_lsn)
-                    VALUES (%s, %s, 0, null)
-                    ON DUPLICATE KEY UPDATE last_pk=%s, full_load_done=0, last_lsn=null
-                """, (table, last_pk, last_pk))
+                            # update migration_log
+                            mysql_cursor.execute("""
+                                INSERT INTO migration_log (table_name, last_pk, full_load_done, last_lsn)
+                                VALUES (%s, %s, 0, null)
+                                ON DUPLICATE KEY UPDATE last_pk=%s, full_load_done=0, last_lsn=null
+                            """, (table, last_pk, last_pk))
 
-                self.log(f"Table {table}: saved last_pk={last_pk}, set full_load_done=0")
+                            self.log(f"Table {table}: saved last_pk={last_pk}, set full_load_done=0")
+                            
+                        except Exception as e:
+                            self.log(f"Warning: Failed to process table {table} for last_pk save: {e}")
 
-            mysql_conn.commit()
+                    mysql_conn.commit()
+                    mysql_conn.close()
+                    self.log("MySQL log update complete.")
+                else:
+                    self.log("Skipping last_pk save and full_load reset due to inaccessible MySQL log table.")
 
-            # disable CDC on database
-            sql_cursor.execute("EXEC sys.sp_cdc_disable_db")
-            sql_conn.commit()
 
-            QMessageBox.information(self, "Success", f"CDC disabled on database {db_name}, last_pk saved and full_load reset")
-            self.check_cdc_status()
+                # disable CDC on SQL Server database (Always attempt to do this)
+                sql_cursor.execute("EXEC sys.sp_cdc_disable_db")
+                sql_conn.commit()
+                sql_conn.close()
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to deactivate CDC: {e}")
+                status_msg = f"CDC disabled on SQL Server database {db_name}."
+                if log_table_exists:
+                    status_msg += " Last PK saved and full load reset in MySQL."
+                
+                QMessageBox.information(self, "Success", status_msg)
+                self.check_cdc_status()
+
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to deactivate CDC: {e}")
+                if sql_conn:
+                    sql_conn.close()
+                if mysql_conn:
+                    mysql_conn.close()
 
 
     def show_cdc_table_sizes(self):
