@@ -175,15 +175,59 @@ def create_mysql_table_if_not_exists(mysql_cursor, mysql_conn, sql_cursor, sql_s
     mysql_cursor.execute("SHOW TABLES LIKE %s", (table,))
     if mysql_cursor.fetchone():
         return
+    
+    # --- MODIFICATION START ---
+    
+    # 1. Create a dictionary for quick lookup of column metadata (name -> sql_type)
+    #    This uses the full 'columns' list fetched from SQL Server
+    col_metadata = {name: sql_type for name, sql_type in columns}
+    
     cols_def = []
-    for name, sql_type in columns:
+    
+    # 2. Iterate ONLY over the selected column names (col_names)
+    for name in col_names:
+        # Get the type from the metadata dictionary
+        sql_type = col_metadata.get(name)
+        
+        if sql_type is None:
+            # Should not happen if col_names is correctly derived from all_columns, 
+            # but acts as a safety check.
+            logger.log(f"Warning: Selected column '{name}' not found in SQL Server metadata for table '{table}'. Skipping.")
+            continue
+            
         mysql_type = map_type(sql_type)
         null_def = "NULL" if name not in pk_cols else "NOT NULL"
         cols_def.append(f"`{name}` {mysql_type} {null_def}")
-    pk_def = f", PRIMARY KEY ({', '.join(f'`{c}`' for c in pk_cols)})"
+        
+    # --- MODIFICATION END ---
+    
+    # Check if any columns were successfully processed
+    if not cols_def:
+        logger.log(f"Error: No valid columns selected or processed for table {table}. Skipping table creation.")
+        return
+
+    # The rest of the logic remains the same
+    pk_def = f", PRIMARY KEY ({', '.join(f'`{c}`' for c in pk_cols if c in col_names)})" 
+    
+    # Ensure primary keys used in PK definition are actually in the selected columns
+    
     create_table_sql = f"CREATE TABLE `{table}` ({', '.join(cols_def)}{pk_def}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     mysql_cursor.execute(create_table_sql)
     mysql_conn.commit()
+
+    # Enable CDC with captured_column_list (uses col_names)
+    try:
+        captured_columns = ",".join([f"[{c}]" for c in col_names])
+        sql_cursor.execute(f"""EXEC sys.sp_cdc_enable_table
+            @source_schema = 'dbo',
+            @source_name = '{table}',
+            @role_name = NULL,
+            @captured_column_list = '{captured_columns}'
+        """)
+        sql_server_conn.commit()
+        logger.log(f"CDC enabled for table {table} with captured columns: {captured_columns}")
+    except Exception as e:
+        logger.log(f"CDC already enabled or failed for table {table}: {e}")
 
     # Enable CDC with captured_column_list
     try:
