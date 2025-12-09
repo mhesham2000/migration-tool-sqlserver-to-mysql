@@ -461,7 +461,7 @@ def do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, 
         if len(upsert_batch) >= 1:
             flush_upserts()
             thread.progress_signal.emit(processed_count)
-            logger.log(f"{table} Incremental: Processed {processed_count} changes so far (Batch Mode).")
+            logger.log(f"Table {table} Insert row with PK={row_dict[pk_cols[0]]}")
 
             mysql_conn.commit()
             
@@ -658,7 +658,7 @@ class MigrationThread(QThread):
         finally:
             self.finished_signal.emit()
             
-    def backoff_sleep(self, attempt, base=15, cap=241):
+    def backoff_sleep(self, attempt, base=15, cap=240):
         wait = min(base * (2 ** attempt), cap)
         self.log_signal.emit(f"Backoff sleeping for {wait} seconds...")
         self.sleep(wait)
@@ -875,12 +875,13 @@ class MigrationGUI(QMainWindow):
         self.auto_start_timer.timeout.connect(self.auto_start_migration)
         self.auto_start_timer.start(1000)  # Start after 1 second
 
-        # --- NEW: Periodic CDC Activation Timer ---
-        self.cdc_sync_timer = QTimer(self)
-        self.cdc_sync_timer.timeout.connect(self.run_periodic_cdc_sync)
-        # Set interval to 5 minutes (300,000 milliseconds)
-        self.cdc_sync_timer.start(5 * 60 * 1000) 
-        self.log("Started 5-minute periodic CDC sync timer.")
+        # --- NEW: Daily CDC Activation Scheduler ---   
+        self.daily_scheduler_timer = QTimer(self)
+        self.daily_scheduler_timer.timeout.connect(self.run_daily_cdc_schedule)
+        
+        # Start the timer to check every minute (60,000 ms)
+        self.daily_scheduler_timer.start(60 * 1000) 
+        self.log("Started daily CDC schedule timer (checks every minute).")
         # --- END NEW ---
 
     def initTrayIcon(self):
@@ -1741,7 +1742,7 @@ class MigrationGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to check CDC status: {e}")
 
-    def activate_cdc(self):
+    def activate_cdc(self, show_message=True): # New argument
             try:
                 config = load_config()
                 server = config.get("sql_server")
@@ -1849,16 +1850,20 @@ class MigrationGUI(QMainWindow):
                     except Exception as e:
                         self.log(f"CDC enable failed or already active for table {table}: {e}")
 
-                QMessageBox.information(self, "Success", f"Schema synchronized and CDC enabled on database {db_name} and all configured tables")
+                if show_message: # Only show message if called manually
+                    QMessageBox.information(self, "Success", f"Schema synchronized and CDC enabled on database {db_name} and all configured tables")
+                
                 self.check_cdc_status()
 
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to activate CDC or synchronize schema: {e}")
+                self.log(f"Failed to activate CDC or synchronize schema: {e}")
+                if show_message: # Only show error message if called manually
+                    QMessageBox.critical(self, "Error", f"Failed to activate CDC or synchronize schema: {e}")
                 if sql_conn: sql_conn.close()
                 if mysql_conn: mysql_conn.close()
 
 
-    def deactivate_cdc(self):
+    def deactivate_cdc(self, show_message=True): # New argument
             try:
                 config = load_config()
                 server = config.get("sql_server")
@@ -1953,11 +1958,15 @@ class MigrationGUI(QMainWindow):
                 if log_table_exists:
                     status_msg += " Last PK saved and full load reset in MySQL."
                 
-                QMessageBox.information(self, "Success", status_msg)
+                if show_message: # Only show message if called manually
+                    QMessageBox.information(self, "Success", status_msg)
+                    
                 self.check_cdc_status()
 
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to deactivate CDC: {e}")
+                self.log(f"Failed to deactivate CDC: {e}")
+                if show_message: # Only show error message if called manually
+                    QMessageBox.critical(self, "Error", f"Failed to deactivate CDC: {e}")
                 if sql_conn:
                     sql_conn.close()
                 if mysql_conn:
@@ -2105,6 +2114,35 @@ class MigrationGUI(QMainWindow):
             except Exception as e:
                 self.row_counts_table.setRowCount(0) # Clear table on error
                 QMessageBox.critical(self, "Error", f"An error occurred: {e}")
+
+    def run_daily_cdc_schedule(self):
+            """
+            Runs daily CDC deactivation and reactivation at specific times.
+            - Deactivate: 03:00 AM (03:00)
+            - Activate: 10:00 AM (22:00) - Assuming 1 hour downtime for maintenance, adjust as needed.
+            """
+            now = datetime.now()
+            
+            # Time for CDC Deactivation (03:00 AM)
+            if now.hour == 3 and now.minute == 0:
+                self.log("--- Daily CDC Deactivation triggered at 03:00 ---")
+                # Stop the continuous migration thread if it's running before disabling CDC
+                if self.migration_thread and self.migration_thread.running:
+                    self.stop_migration()
+                    
+                self.deactivate_cdc(show_message=False)
+                self.log("--- Daily CDC Deactivation complete ---")
+                
+            # Time for CDC Reactivation (03:05 AM - allowing 5 minutes for deactivation process)
+            # We perform activation shortly after deactivation to minimize downtime.
+            if now.hour == 3 and now.minute == 5: 
+                self.log("--- Daily CDC Reactivation triggered at 21:05 ---")
+                self.activate_cdc(show_message=False)
+                self.log("--- Daily CDC Reactivation complete ---")
+                
+                # Restart the migration thread if it was running previously
+                if self.start_btn.isEnabled(): # Check if migration is not currently running
+                    self.start_migration() # This restarts the data sync
 
 
     def run_periodic_cdc_sync(self):
