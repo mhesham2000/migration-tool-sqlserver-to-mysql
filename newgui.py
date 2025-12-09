@@ -1961,143 +1961,159 @@ class MigrationGUI(QMainWindow):
 
 
     def sync_rows_by_pk(self, table_name):
-            self.log(f"Starting re-sync for table: {table_name}")
-            self.progress_bar.setVisible(True)
-            try:
-                config = load_config()
-                sql_server = config.get("sql_server")
-                source_db = config.get("source_db")
-                mysql_host = config.get("mysql_host")
-                mysql_user = config.get("mysql_user")
-                mysql_pass = config.get("mysql_password")
-                mysql_db = config.get("mysql_db_name")
+                self.log(f"Starting re-sync for table: {table_name}")
+                self.progress_bar.setVisible(True)
+                try:
+                    # --- 1. Load Configuration and Establish Connections ---
+                    config = load_config()
+                    sql_server = config.get("sql_server")
+                    source_db = config.get("source_db")
+                    mysql_host = config.get("mysql_host")
+                    mysql_user = config.get("mysql_user")
+                    mysql_pass = config.get("mysql_password")
+                    mysql_db = config.get("mysql_db_name")
 
-                sql_conn = connect_sql_server(sql_server, source_db)
-                sql_cursor = sql_conn.cursor()
-                mysql_conn, mysql_cursor = connect_mysql(mysql_db, mysql_host, mysql_user, mysql_pass)
+                    sql_conn = connect_sql_server(sql_server, source_db)
+                    sql_cursor = sql_conn.cursor()
+                    mysql_conn, mysql_cursor = connect_mysql(mysql_db, mysql_host, mysql_user, mysql_pass)
 
-                # Get the primary key column name
-                pk_cols = get_primary_keys(sql_cursor, table_name, [])
-                if not pk_cols:
-                    QMessageBox.warning(self, "Error", f"No primary key found for table {table_name}.")
-                    return
-                pk_col = pk_cols[0]
+                    # Get the primary key column name
+                    pk_cols = get_primary_keys(sql_cursor, table_name, [])
+                    if not pk_cols:
+                        QMessageBox.warning(self, "Error", f"No primary key found for table {table_name}.")
+                        return
+                    pk_col = pk_cols[0]
 
-                self.log("Fetching Primary Keys from SQL Server...")
-                sql_cursor.execute(f"SELECT [{pk_col}] FROM {table_name}")
-                sql_pks = {row[0] for row in sql_cursor.fetchall()}
-
-                self.log("Fetching Primary Keys from MySQL...")
-                mysql_cursor.execute(f"SELECT `{pk_col}` FROM `{table_name}`")
-                mysql_pks = {row[0] for row in mysql_cursor.fetchall()}
-
-                # Find differences
-                pks_to_insert = list(sql_pks - mysql_pks)
-                pks_to_delete = list(mysql_pks - sql_pks)
-
-                total_rows_to_sync = len(pks_to_insert) + len(pks_to_delete)
-                self.progress_bar.setMinimum(0)
-                self.progress_bar.setMaximum(total_rows_to_sync)
-                current_progress = 0
-
-                # ---------------------------
-                # 1. Handle Inserts / Updates (Batch Optimized)
-                # ---------------------------
-                if pks_to_insert:
-                    self.log(f"Found {len(pks_to_insert)} rows to insert/update...")
+                    # --- 2. Determine Selected Columns from Config ---
+                    config_data = load_config()
                     
-                    # رفع حجم الدفعة لتسريع العمليات
-                    chunk_size = 1000 
-                    
-                    # تحضير جملة الـ Insert مرة واحدة
+                    # Fetch all possible columns from SQL Server
                     sql_cursor.execute(f"SELECT TOP 0 * FROM {table_name}")
-                    col_names = [col[0] for col in sql_cursor.description]
+                    all_columns = [col[0] for col in sql_cursor.description]
                     
-                    placeholders_mysql = ','.join(['%s'] * len(col_names))
-                    update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
+                    # Determine the final list of columns based on config.json
+                    table_config = config_data.get(table_name, {})
+                    col_selection = table_config.get("columns", "*") # Default to all if not set
+                    col_names = resolve_columns(all_columns, col_selection)
                     
-                    # استخدام INSERT IGNORE إذا لم يكن هناك تحديث، أو ON DUPLICATE KEY UPDATE
-                    if update_clause:
-                        insert_sql = (
-                            f"INSERT INTO `{table_name}` ({', '.join(f'`{c}`' for c in col_names)}) "
-                            f"VALUES ({placeholders_mysql}) "
-                            f"ON DUPLICATE KEY UPDATE {update_clause}"
-                        )
-                    else:
-                        insert_sql = (
-                            f"INSERT IGNORE INTO `{table_name}` ({', '.join(f'`{c}`' for c in col_names)}) "
-                            f"VALUES ({placeholders_mysql})"
-                        )
+                    if not col_names:
+                        self.log(f"Error: No columns selected for table {table_name}.")
+                        QMessageBox.critical(self, "Error", f"No columns selected for table {table_name}.")
+                        return
+                    
+                    # Create the comma-separated list of columns for the SQL Server SELECT clause
+                    col_list_sql = ",".join(f"[{c}]" for c in col_names)
+                    
+                    # --- 3. Key Comparison (Finding Differences) ---
+                    self.log("Fetching Primary Keys from SQL Server...")
+                    sql_cursor.execute(f"SELECT [{pk_col}] FROM {table_name}")
+                    sql_pks = {row[0] for row in sql_cursor.fetchall()}
 
-                    for i in range(0, len(pks_to_insert), chunk_size):
-                        # تحديث الواجهة للسماح بإلغاء العملية وعدم تعليق البرنامج
-                        QApplication.processEvents()
+                    self.log("Fetching Primary Keys from MySQL...")
+                    mysql_cursor.execute(f"SELECT `{pk_col}` FROM `{table_name}`")
+                    mysql_pks = {row[0] for row in mysql_cursor.fetchall()}
+
+                    # Find differences
+                    pks_to_insert = list(sql_pks - mysql_pks)
+                    pks_to_delete = list(mysql_pks - sql_pks)
+
+                    total_rows_to_sync = len(pks_to_insert) + len(pks_to_delete)
+                    self.progress_bar.setMinimum(0)
+                    self.progress_bar.setMaximum(total_rows_to_sync)
+                    current_progress = 0
+
+                    # --- 4. Handle Inserts / Updates (Batch Optimized Upsert) ---
+                    if pks_to_insert:
+                        self.log(f"Found {len(pks_to_insert)} rows to insert/update...")
                         
-                        chunk = pks_to_insert[i:i + chunk_size]
+                        chunk_size = 1000 
                         
-                        # جلب البيانات من SQL Server
-                        placeholders = ','.join(['?'] * len(chunk))
-                        sql_query = f"SELECT * FROM {table_name} WHERE [{pk_col}] IN ({placeholders})"
-                        sql_cursor.execute(sql_query, chunk)
-                        rows_to_sync = sql_cursor.fetchall()
+                        # Prepare MySQL INSERT/UPSERT SQL using the configured columns
+                        placeholders_mysql = ','.join(['%s'] * len(col_names))
+                        update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
+                        
+                        if update_clause:
+                            insert_sql = (
+                                f"INSERT INTO `{table_name}` ({', '.join(f'`{c}`' for c in col_names)}) "
+                                f"VALUES ({placeholders_mysql}) "
+                                f"ON DUPLICATE KEY UPDATE {update_clause}"
+                            )
+                        else:
+                            insert_sql = (
+                                f"INSERT IGNORE INTO `{table_name}` ({', '.join(f'`{c}`' for c in col_names)}) "
+                                f"VALUES ({placeholders_mysql})"
+                            )
 
-                        # تحضير البيانات للـ Batch Insert
-                        batch_data = []
-                        for row in rows_to_sync:
-                            row_data = tuple(convert_value(getattr(row, col)) for col in col_names if hasattr(row, col))
-                            batch_data.append(row_data)
+                        for i in range(0, len(pks_to_insert), chunk_size):
+                            QApplication.processEvents()
+                            
+                            chunk = pks_to_insert[i:i + chunk_size]
+                            
+                            # --- MODIFICATION: Use selected columns in SQL Server SELECT ---
+                            placeholders = ','.join(['?'] * len(chunk))
+                            # Use col_list_sql (which contains only selected columns)
+                            sql_query = f"SELECT {col_list_sql} FROM {table_name} WHERE [{pk_col}] IN ({placeholders})"
+                            sql_cursor.execute(sql_query, chunk)
+                            rows_to_sync = sql_cursor.fetchall()
 
-                        # تنفيذ الإدراج دفعة واحدة (Huge Performance Boost)
-                        if batch_data:
+                            # Prepare the data for Batch Insert
+                            batch_data = []
+                            for row in rows_to_sync:
+                                # Note: The conversion must match the order of col_names
+                                # Since we SELECTed only col_names, we can use the cursor description
+                                row_data = tuple(convert_value(col_val) for col_val in row) 
+                                batch_data.append(row_data)
+
+                            # Execute the Batch Insert/Upsert
+                            if batch_data:
+                                try:
+                                    mysql_cursor.executemany(insert_sql, batch_data)
+                                    mysql_conn.commit()
+                                except Exception as e:
+                                    self.log(f"Error in sync batch insert: {e}")
+
+                            # Update progress
+                            current_progress += len(chunk)
+                            self.progress_bar.setValue(current_progress)
+                            self.log(f"Synced batch of {len(chunk)} rows (Total: {current_progress}/{total_rows_to_sync})")
+                        
+                    # --- 5. Handle Deletes (Batch Optimized) ---
+                    if pks_to_delete:
+                        self.log(f"Found {len(pks_to_delete)} rows to delete...")
+                        
+                        chunk_size = 1000
+                        
+                        for i in range(0, len(pks_to_delete), chunk_size):
+                            QApplication.processEvents()
+
+                            chunk = pks_to_delete[i:i + chunk_size]
+                            placeholders_mysql = ','.join(['%s'] * len(chunk))
+                            delete_sql = f"DELETE FROM `{table_name}` WHERE `{pk_col}` IN ({placeholders_mysql})"
+                            
                             try:
-                                mysql_cursor.executemany(insert_sql, batch_data)
+                                mysql_cursor.execute(delete_sql, chunk)
                                 mysql_conn.commit()
                             except Exception as e:
-                                self.log(f"Error in sync batch insert: {e}")
+                                self.log(f"Error in sync batch delete: {e}")
+                                
+                            current_progress += len(chunk)
+                            self.progress_bar.setValue(current_progress)
 
-                        # تحديث شريط التقدم
-                        current_progress += len(chunk)
-                        self.progress_bar.setValue(current_progress)
-                        self.log(f"Synced batch of {len(chunk)} rows (Total: {current_progress}/{total_rows_to_sync})")
+                    # --- 6. Finalization ---
+                    sql_conn.close()
+                    mysql_conn.close()
                     
-                # ---------------------------
-                # 2. Handle Deletes (Batch Optimized)
-                # ---------------------------
-                if pks_to_delete:
-                    self.log(f"Found {len(pks_to_delete)} rows to delete...")
+                    self.log(f"Re-sync for {table_name} completed successfully.")
+                    QMessageBox.information(self, "Success", f"Re-sync for {table_name} completed.")
+                    self.get_row_counts() # Refresh the table
                     
-                    chunk_size = 1000
-                    
-                    for i in range(0, len(pks_to_delete), chunk_size):
-                        QApplication.processEvents()
+                    self.progress_bar.setValue(total_rows_to_sync)
+                    self.progress_bar.setVisible(False)
 
-                        chunk = pks_to_delete[i:i + chunk_size]
-                        placeholders_mysql = ','.join(['%s'] * len(chunk))
-                        delete_sql = f"DELETE FROM `{table_name}` WHERE `{pk_col}` IN ({placeholders_mysql})"
-                        
-                        try:
-                            mysql_cursor.execute(delete_sql, chunk)
-                            mysql_conn.commit()
-                        except Exception as e:
-                            self.log(f"Error in sync batch delete: {e}")
-                            
-                        current_progress += len(chunk)
-                        self.progress_bar.setValue(current_progress)
-
-                sql_conn.close()
-                mysql_conn.close()
-                
-                self.log(f"Re-sync for {table_name} completed successfully.")
-                QMessageBox.information(self, "Success", f"Re-sync for {table_name} completed.")
-                self.get_row_counts() # Refresh the table
-                
-                self.progress_bar.setValue(total_rows_to_sync)
-                self.progress_bar.setVisible(False)
-
-            except Exception as e:
-                self.log(f"Error during re-sync: {e}")
-                QMessageBox.critical(self, "Error", f"Failed to re-sync table {table_name}: {e}")
-                self.progress_bar.setVisible(False)
+                except Exception as e:
+                    self.log(f"Error during re-sync: {e}")
+                    QMessageBox.critical(self, "Error", f"Failed to re-sync table {table_name}: {e}")
+                    self.progress_bar.setVisible(False)
 
 
     def reset_migration_log(self, table_name):
