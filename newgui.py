@@ -2309,6 +2309,24 @@ class MigrationGUI(QMainWindow):
                             current_progress += len(chunk)
                             self.progress_bar.setValue(current_progress)
 
+                    # --- 6. Advance LSN to prevent redundant incremental load ---
+                    self.log(f"Fetching current Max LSN for table: {table_name}")
+                    
+                    # Fetch the absolute maximum LSN from SQL Server
+                    sql_cursor.execute("SELECT sys.fn_cdc_get_max_lsn()")
+                    max_lsn = sql_cursor.fetchone()[0]
+
+                    # Update the migration_log table with the new Max LSN
+                    mysql_cursor.execute("""
+                        INSERT INTO `migration_log` (`table_name`, `last_lsn`)
+                        VALUES (%s, %s)
+                        ON DUPLICATE KEY UPDATE `last_lsn`=%s
+                    """, (table_name, max_lsn, max_lsn))
+                    mysql_conn.commit()
+                    
+                    self.log(f"Successfully updated LSN for {table_name} to prevent repeated changes.")
+                    # --- END LSN ADVANCEMENT ---
+
                     # --- 6. Finalization ---
                     sql_conn.close()
                     mysql_conn.close()
