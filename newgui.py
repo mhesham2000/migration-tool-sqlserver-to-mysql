@@ -1734,64 +1734,120 @@ class MigrationGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to check CDC status: {e}")
 
     def activate_cdc(self):
-        try:
-            config = load_config()
-            server = config.get("sql_server")
-            db_name = config.get("source_db")
+            try:
+                config = load_config()
+                server = config.get("sql_server")
+                db_name = config.get("source_db")
+                mysql_db_name = config.get("mysql_db_name")
+                mysqlhost = config.get("mysql_host")
+                mysqluser = config.get("mysql_user")
+                mysqlpassword = config.get("mysql_password")
 
-            if not server or not db_name:
-                QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
-                return
+                if not server or not db_name:
+                    QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
+                    return
 
-            sql_conn = connect_sql_server(server, db_name)
-            sql_cursor = sql_conn.cursor()
+                sql_conn = connect_sql_server(server, db_name)
+                sql_cursor = sql_conn.cursor()
 
-            # enable CDC on database
-            sql_cursor.execute("EXEC sys.sp_cdc_enable_db")
-            sql_conn.commit()
-            self.log(f"CDC enabled on database {db_name}")
+                # Connect to MySQL
+                mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
+                if not mysql_conn:
+                    raise Exception("Failed to connect to MySQL for schema check.")
 
-            # loop on tables and enable CDC
-            tables = [t.strip() for t in config.get("tables", "").split(",") if t.strip()]
-            for table in tables:
-                # determine captured columns
-                table_conf = config.get(table, {})
-                columns = table_conf.get("columns")
-                if not columns or columns.strip() == "*":
-                    # fallback use all columns
-                    sql_cursor.execute(f"""
-                        SELECT COLUMN_NAME 
-                        FROM INFORMATION_SCHEMA.COLUMNS 
-                        WHERE TABLE_NAME = '{table}'
-                    """)
+                self.log(f"Starting column schema synchronization for tables in {mysql_db_name}...")
+                
+                tables = [t.strip() for t in config.get("tables", "").split(",") if t.strip()]
+                for table in tables:
+                    self.log(f"Checking schema for table: {table}")
+                    
+                    # 1. Get the list of ALL columns from SQL Server (to get data types)
+                    sql_cursor.execute(f"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION")
+                    sql_all_columns = {row[0]: row[1] for row in sql_cursor.fetchall()}
+                    
+                    # 2. Get the list of REQUIRED columns from config.json (resolved list)
+                    table_conf = config.get(table, {})
+                    col_selection = table_conf.get("columns", "*") 
+                    
+                    # Resolve the final list of columns to be in the MySQL table
+                    required_col_names = resolve_columns(list(sql_all_columns.keys()), col_selection)
+                    
+                    # 3. Get the list of CURRENT columns in the MySQL table
+                    mysql_cursor.execute(f"SHOW COLUMNS FROM `{table}`")
+                    mysql_current_columns = {row[0] for row in mysql_cursor.fetchall()}
+                    
+                    # 4. Determine missing columns
+                    missing_cols = [
+                        col for col in required_col_names 
+                        if col not in mysql_current_columns and col in sql_all_columns
+                    ]
+                    
+                    if missing_cols:
+                        self.log(f"Found {len(missing_cols)} missing columns in MySQL for table {table}.")
+                        
+                        # 5. Add missing columns
+                        for col_name in missing_cols:
+                            sql_type = sql_all_columns[col_name]
+                            mysql_type = map_type(sql_type)
+                            
+                            # Use ALTER TABLE ADD COLUMN
+                            alter_sql = f"ALTER TABLE `{table}` ADD COLUMN `{col_name}` {mysql_type} NULL"
+                            
+                            try:
+                                mysql_cursor.execute(alter_sql)
+                                self.log(f"Successfully added column `{col_name}` ({mysql_type}) to MySQL table `{table}`.")
+                            except Exception as e:
+                                self.log(f"Failed to add column `{col_name}` to MySQL table `{table}`: {e}")
+                        
+                        mysql_conn.commit()
+                    else:
+                        self.log(f"MySQL table {table} has all required columns.")
+                
+                self.log("Column schema synchronization complete.")
+
+                # --- Now proceed with enabling CDC ---
+                
+                # Close MySQL connection (will be reopened by the loop below)
+                mysql_conn.close()
+
+                # Enable CDC on database
+                sql_cursor.execute("EXEC sys.sp_cdc_enable_db")
+                sql_conn.commit()
+                self.log(f"CDC enabled on database {db_name}")
+
+                # loop on tables and enable CDC for each
+                for table in tables:
+                    # determine captured columns (must be the final required list)
+                    table_conf = config.get(table, {})
+                    col_selection = table_conf.get("columns", "*")
+                    
+                    # Re-fetch all columns to resolve selection
+                    sql_cursor.execute(f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table}'")
                     cols = [row[0] for row in sql_cursor.fetchall()]
-                    captured_cols = ",".join([f"[{c}]" for c in cols])
-                else:
-                    captured_cols = ",".join([f"[{c.strip()}]" for c in columns.split(",")])
+                    required_cols = resolve_columns(cols, col_selection)
+                    
+                    captured_cols = ",".join([f"[{c}]" for c in required_cols])
 
-                try:
-                    sql_cursor.execute(f"""
-                        EXEC sys.sp_cdc_enable_table
-                            @source_schema = 'dbo',
-                            @source_name   = '{table}',
-                            @role_name     = NULL,
-                            @captured_column_list = '{captured_cols}'
-                    """)
-                    sql_conn.commit()
-                    self.log(f"CDC enabled for table {table} with columns {captured_cols}")
-                except Exception as e:
-                    self.log(f"CDC enable failed or already active for table {table}: {e}")
+                    try:
+                        sql_cursor.execute(f"""
+                            EXEC sys.sp_cdc_enable_table
+                                @source_schema = 'dbo',
+                                @source_name   = '{table}',
+                                @role_name     = NULL,
+                                @captured_column_list = '{captured_cols}'
+                        """)
+                        sql_conn.commit()
+                        self.log(f"CDC enabled for table {table} with columns: {captured_cols}")
+                    except Exception as e:
+                        self.log(f"CDC enable failed or already active for table {table}: {e}")
 
-            # # sql_cursor.execute("EXEC sys.sp_cdc_start_job @job_type = 'cleanup'")
-            # sql_cursor.execute("EXEC sys.sp_cdc_start_job @job_type = 'cleanup'")
-            # sql_conn.commit()
-            # self.log("Started CDC cleanup job.")
+                QMessageBox.information(self, "Success", f"Schema synchronized and CDC enabled on database {db_name} and all configured tables")
+                self.check_cdc_status()
 
-            QMessageBox.information(self, "Success", f"CDC enabled on database {db_name} and all configured tables")
-            self.check_cdc_status()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to activate CDC: {e}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to activate CDC or synchronize schema: {e}")
+                if sql_conn: sql_conn.close()
+                if mysql_conn: mysql_conn.close()
 
 
     def deactivate_cdc(self):
