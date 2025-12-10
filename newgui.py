@@ -784,21 +784,46 @@ class DatabaseBrowser(QTreeWidget):
             parent.on_tables_selected(selected_tables)
                 
     def get_selected_columns(self, table_path):
+        """
+        Retrieves a list of selected column names for a given table path (db.table).
+        Guaranteed to return a list, not None.
+        """
+        if '.' not in table_path:
+            # Should not happen if tables are added correctly, but as a fallback
+            return []
+
         db_name, table_name = table_path.split('.')
         
-        # Find the table item
+        # 1. Find the table item
         for i in range(self.topLevelItemCount()):
             db_item = self.topLevelItem(i)
             if db_item.text(0) == db_name:
                 for j in range(db_item.childCount()):
                     table_item = db_item.child(j)
+                    
+                    # Check if this is the correct table item
                     if table_item.text(0) == table_name:
                         columns = []
+                        
+                        # Check if columns are loaded (if childCount is 1 and the child is not 'column', it's still loading)
+                        if table_item.childCount() == 1 and table_item.child(0).data(0, Qt.UserRole) != "column":
+                            # The table was not expanded, or only the "Loading..." placeholder is present.
+                            # We cannot determine selection, so we return an empty list, implying default behavior ("*")
+                            return []
+
+                        # 2. Iterate through loaded columns and check state
                         for k in range(table_item.childCount()):
                             col_item = table_item.child(k)
-                            if col_item.checkState(0) == Qt.Checked:
-                                columns.append(col_item.data(0, Qt.UserRole + 1))  # Get column name
+                            
+                            # Ensure we are dealing with a column item, not a placeholder
+                            if col_item.data(0, Qt.UserRole) == "column":
+                                if col_item.checkState(0) == Qt.Checked:
+                                    # Get the stored column name
+                                    columns.append(col_item.data(0, Qt.UserRole + 1)) 
+                                    
                         return columns
+        
+        # 3. If the database or table item was never found in the browser tree, return empty list
         return []
     
     def select_all_columns(self, table_item):
@@ -1448,19 +1473,18 @@ class MigrationGUI(QMainWindow):
             
     def save_config(self):
         try:
-            # Get selected tables
+            # Get selected tables and determine source database
             tables = []
-            for i in range(self.selected_tables_list.count()):
-                tables.append(self.selected_tables_list.item(i).text())
-                
-            # Create the configuration in the format your script expects
-
             source_db = ""
             if self.selected_tables_list.count() > 0:
                 first_table_path = self.selected_tables_list.item(0).text()
                 if '.' in first_table_path:
                     source_db = first_table_path.split('.')[0]
 
+            for i in range(self.selected_tables_list.count()):
+                tables.append(self.selected_tables_list.item(i).text())
+                
+            # Create the configuration dictionary
             config = {
                 'sql_server': self.sql_server_input.text(),
                 'mysql_host': self.mysql_host_input.text(),
@@ -1468,6 +1492,7 @@ class MigrationGUI(QMainWindow):
                 'mysql_user': self.mysql_user_input.text(),
                 'mysql_password': self.mysql_pass_input.text(),
                 'source_db': source_db, 
+                # Store only the table names (without database prefix)
                 'tables': ','.join([t.split('.')[1] if '.' in t else t for t in tables])
             }
             
@@ -1475,12 +1500,20 @@ class MigrationGUI(QMainWindow):
             for table_path in tables:
                 # Extract just the table name (remove database prefix if present)
                 table_name = table_path.split('.')[1] if '.' in table_path else table_path
+                
+                # Retrieve columns. This MUST return a list (empty or populated).
                 columns = self.db_browser.get_selected_columns(table_path)
+                
+                # Save the list of selected columns as a comma-separated string
                 if columns:
                     config[table_name] = {"columns": ",".join(columns)}
+                else:
+                    # If columns is empty (either none were checked, or metadata wasn't loaded),
+                    # save "*" to indicate all columns should be used by default.
+                    config[table_name] = {"columns": "*"}
             
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(config, f, indent=4)
+            with open(CONFIG_FILE, 'w', encoding="utf-8") as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
                 
             self.log("Configuration saved successfully")
             QMessageBox.information(self, "Success", "Configuration saved successfully")
