@@ -85,10 +85,10 @@ def map_type(sql_type):
         return "VARCHAR(255)"
     return "TEXT"
 
-def connect_sql_server(server, database=None):
+def connect_sql_server(driver, server, database=None):
     while True:
         try:
-            connection_string = 'DRIVER={ODBC Driver 17 for SQL Server};' \
+            connection_string = f'DRIVER={{{driver}}};' \
                                f'SERVER={server};'
             
             if database:
@@ -541,6 +541,7 @@ class MigrationThread(QThread):
         try:
             source_db = self.config['source_db']
             sql_server = self.config['sql_server']
+            sql_driver = self.config['sql_driver'] # <--- MUST BE PRESENT
             mysqlhost = self.config['mysql_host']
             mysqluser = self.config['mysql_user']
             mysqlpassword = self.config['mysql_password']
@@ -550,7 +551,7 @@ class MigrationThread(QThread):
             self.log_signal.emit("Starting migration process...")
             
             # Connect to the specific database
-            sql_server_conn = connect_sql_server(sql_server, source_db)
+            sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db)
             sql_cursor = sql_server_conn.cursor()
             mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
             ensure_migration_log_table(mysql_cursor, mysql_conn)
@@ -618,7 +619,7 @@ class MigrationThread(QThread):
                         except: 
                             pass
                         # Reconnect to the specific database
-                        sql_server_conn = connect_sql_server(sql_server, source_db)
+                        sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db) # <--- PASS DRIVER
                         sql_cursor = sql_server_conn.cursor()
                         mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
                         ensure_migration_log_table(mysql_cursor, mysql_conn)
@@ -636,7 +637,7 @@ class MigrationThread(QThread):
                     except: 
                         pass
                     # Reconnect to the specific database
-                    sql_server_conn = connect_sql_server(sql_server, source_db)
+                    sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db) # <--- PASS DRIVER
                     sql_cursor = sql_server_conn.cursor()
                     self.log_signal.emit("Reconnected to SQL Server")
                     mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
@@ -682,10 +683,10 @@ class DatabaseBrowser(QTreeWidget):
         self.sql_conn = None
         self.sql_cursor = None
         
-    def connect_to_sql_server(self, server):
+    def connect_to_sql_server(self, driver, server): 
         try:
             self.sql_conn = pyodbc.connect(
-                'DRIVER={ODBC Driver 17 for SQL Server};'
+                f'DRIVER={{{driver}}};'
                 f'SERVER={server};'
                 'Trusted_Connection=yes;',
                 timeout=5
@@ -940,14 +941,36 @@ class MigrationGUI(QMainWindow):
         sql_group = QGroupBox("SQL Server Connection")
         sql_group.setObjectName("SQL Server Connection")
         sql_layout = QGridLayout(sql_group)
+
+        # --- MODIFIED DRIVER INPUT ---
+        sql_layout.addWidget(QLabel("ODBC Driver:"), 0, 0)
         
-        sql_layout.addWidget(QLabel("SQL Server:"), 0, 0)
+        driver_version_layout = QHBoxLayout()
+        self.sql_driver_prefix = QLabel("ODBC Driver")
+        self.sql_driver_prefix.setStyleSheet("font-weight: bold;")
+        driver_version_layout.addWidget(self.sql_driver_prefix)
+        
+        self.sql_driver_version_combo = QComboBox()
+        self.sql_driver_version_combo.addItems(["11", "13", "13.1", "14", "17", "18"])
+        self.sql_driver_version_combo.setCurrentText("17") # Set default
+        driver_version_layout.addWidget(self.sql_driver_version_combo)
+        
+        self.sql_driver_suffix = QLabel("for SQL Server")
+        self.sql_driver_suffix.setStyleSheet("font-weight: bold;")
+        driver_version_layout.addWidget(self.sql_driver_suffix)
+        
+        driver_version_layout.addStretch(1) # Push elements to the left
+        
+        sql_layout.addLayout(driver_version_layout, 0, 1, 1, 2)
+        # --- END MODIFIED DRIVER INPUT ---
+        
+        sql_layout.addWidget(QLabel("SQL Server:"), 1, 0)
         self.sql_server_input = QLineEdit()
-        sql_layout.addWidget(self.sql_server_input, 0, 1)
+        sql_layout.addWidget(self.sql_server_input, 1, 1)
         
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self.connect_to_sql_server)
-        sql_layout.addWidget(self.connect_btn, 0, 2)
+        sql_layout.addWidget(self.connect_btn, 1, 2)
         
         left_layout.addWidget(sql_group)
         
@@ -1366,6 +1389,16 @@ class MigrationGUI(QMainWindow):
         self.select_all_btn.setEnabled(has_table_selection)
         self.deselect_all_btn.setEnabled(has_table_selection)
         self.add_table_btn.setEnabled(has_table_selection)
+
+
+    def get_full_driver_name(self):
+            """Assembles the full ODBC driver string from the prefix, version, and suffix."""
+            prefix = self.sql_driver_prefix.text().strip()
+            version = self.sql_driver_version_combo.currentText().strip()
+            suffix = self.sql_driver_suffix.text().strip()
+            
+            # Reconstructs the string: "ODBC Driver 11 for SQL Server"
+            return f"{prefix} {version} {suffix}"
         
     def select_all_columns(self):
         """Select all columns in the currently selected table"""
@@ -1405,12 +1438,14 @@ class MigrationGUI(QMainWindow):
         
     def connect_to_sql_server(self):
         server = self.sql_server_input.text()
-        if not server:
-            QMessageBox.warning(self, "Input Error", "Please enter a SQL Server name")
+        driver = self.get_full_driver_name() # USE HELPER
+
+        if not server or not driver:
+            QMessageBox.warning(self, "Input Error", "Please enter a SQL Server name and select an ODBC Driver version.")
             return
             
-        if self.db_browser.connect_to_sql_server(server):
-            self.log(f"Connected to SQL Server: {server}")
+        if self.db_browser.connect_to_sql_server(driver, server):
+            self.log(f"Connected to SQL Server: {server} using driver: {driver}")
             self.populate_db_dropdown()
             
     def on_tables_selected(self, tables):
@@ -1423,6 +1458,12 @@ class MigrationGUI(QMainWindow):
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, 'r') as f:
                     config = json.load(f)
+
+                # --- NEW: Load Driver Version ---
+                saved_version = config.get('sql_driver_version', '17')
+                index = self.sql_driver_version_combo.findText(saved_version)
+                if index != -1:
+                    self.sql_driver_version_combo.setCurrentIndex(index)
                     
                 self.sql_server_input.setText(config.get('sql_server', ''))
                 self.mysql_host_input.setText(config.get('mysql_host', ''))
@@ -1462,6 +1503,7 @@ class MigrationGUI(QMainWindow):
                     source_db = first_table_path.split('.')[0]
 
             config = {
+                'sql_driver_version': self.sql_driver_version_combo.currentText(),
                 'sql_server': self.sql_server_input.text(),
                 'mysql_host': self.mysql_host_input.text(),
                 'mysql_db_name': self.mysql_db_input.text(),
@@ -1489,14 +1531,11 @@ class MigrationGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Error saving configuration: {str(e)}")
             
     def test_connections(self):
+        server = self.sql_server_input.text()
+        driver = self.get_full_driver_name()
         # Test SQL Server connection
         try:
-            sql_conn = pyodbc.connect(
-                'DRIVER={ODBC Driver 17 for SQL Server};'
-                f'SERVER={self.sql_server_input.text()};'
-                'Trusted_Connection=yes;',
-                timeout=5
-            )
+            sql_conn = connect_sql_server(driver, server)
             sql_conn.close()
             self.log("SQL Server connection test: SUCCESS")
         except Exception as e:
@@ -1520,96 +1559,92 @@ class MigrationGUI(QMainWindow):
             QMessageBox.warning(self, "Connection Test", f"MySQL connection failed: {str(e)}")
             
     def start_migration(self):
-        # Get selected tables
+        # 1. Get configuration details from GUI
+        server = self.sql_server_input.text()
+        driver = self.get_full_driver_name()
+        mysqlhost = self.mysql_host_input.text()
+        mysqluser = self.mysql_user_input.text()
+        mysqlpassword = self.mysql_pass_input.text()
+        mysql_db_name = self.mysql_db_input.text()
+        
         tables = []
-
         source_db = ""
+
+        # 2. Extract selected tables and source database
         if self.selected_tables_list.count() > 0:
             first_table_path = self.selected_tables_list.item(0).text()
             if '.' in first_table_path:
                 source_db = first_table_path.split('.')[0]
-
-        # Test connections before starting the thread
-        try:
-            sql_server_conn = connect_sql_server(self.sql_server_input.text(), source_db)
-            sql_cursor = sql_server_conn.cursor()
-            mysql_conn, mysql_cursor = connect_mysql(self.mysql_db_input.text(), self.mysql_host_input.text(), self.mysql_user_input.text(), self.mysql_pass_input.text())
+                
+            db_names = set()
+            for i in range(self.selected_tables_list.count()):
+                table_path = self.selected_tables_list.item(i).text()
+                if '.' in table_path:
+                    db_name, table_name = table_path.split('.')
+                    db_names.add(db_name)
+                    tables.append(table_name)
+                else:
+                    tables.append(table_path) # Should not happen if browser is used correctly
+        
+        # 3. Validation Checks
+        if not tables:
+            QMessageBox.warning(self, "Validation Error", "Please select at least one table to migrate")
+            return
             
+        if len(db_names) > 1:
+            QMessageBox.warning(self, "Validation Error", "All tables must be from the same database")
+            return
+            
+        if not all([driver, server, mysqlhost, mysqluser, mysql_db_name]):
+            QMessageBox.warning(self, "Validation Error", "Please fill in all required connection fields")
+            return
+        
+        # 4. Test Connections
+        try:
+            # Test SQL Server connection (using the new driver parameter)
+            sql_server_conn = connect_sql_server(driver, server, source_db)
+            sql_cursor = sql_server_conn.cursor()
+            sql_server_conn.close() # Close test connection
+
+            # Test MySQL connection
+            mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
             if not mysql_conn:
-                # If MySQL connection fails, display a message and return
                 QMessageBox.critical(self, "Connection Error", "Failed to connect to MySQL. Please check your credentials.")
                 return
-
-            # Close the test connections as they will be re-established in the thread
-            sql_server_conn.close()
-            mysql_conn.close()
+            mysql_conn.close() # Close test connection
 
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", f"Failed to establish initial connections: {str(e)}")
             return
 
-        for i in range(self.selected_tables_list.count()):
-            table_path = self.selected_tables_list.item(i).text()
-            # Extract just the table name (remove database prefix if present)
-            table_name = table_path.split('.')[1] if '.' in table_path else table_path
-            tables.append(table_name)
-            
-        if not tables:
-            QMessageBox.warning(self, "Validation Error", "Please select at least one table to migrate")
-            return
-            
-        if not all([
-            self.sql_server_input.text(),
-            self.mysql_host_input.text(),
-            self.mysql_db_input.text(),
-            self.mysql_user_input.text()
-        ]):
-            QMessageBox.warning(self, "Validation Error", "Please fill in all required fields")
-            return
-            
-        # Check if we have the same database for all tables
-        db_names = set()
-        for i in range(self.selected_tables_list.count()):
-            table_path = self.selected_tables_list.item(i).text()
-            if '.' in table_path:
-                db_name, table_name = table_path.split('.')
-                db_names.add(db_name)
-        
-        if len(db_names) > 1:
-            QMessageBox.warning(self, "Validation Error", "All tables must be from the same database")
-            return
-            
-        # Get the database name (use the first one if available, otherwise use a default)
-        source_db = list(db_names)[0] if db_names else "master"
-        
+        # 5. Assemble Configuration for Thread
         config = {
-            'sql_server': self.sql_server_input.text(),
+            'sql_driver': driver,
+            'sql_server': server,
             'source_db': source_db,
-            'mysql_host': self.mysql_host_input.text(),
-            'mysql_db_name': self.mysql_db_input.text(),
-            'mysql_user': self.mysql_user_input.text(),
-            'mysql_password': self.mysql_pass_input.text(),
-            'tables': ','.join(tables)  # Use just table names
+            'mysql_host': mysqlhost,
+            'mysql_db_name': mysql_db_name,
+            'mysql_user': mysqluser,
+            'mysql_password': mysqlpassword,
+            'tables': ','.join(tables)
         }
         
-        # Save column selections to config (using just table name as key)
+        # Add column selections to config_data
         config_data = load_config()
         for i in range(self.selected_tables_list.count()):
             table_path = self.selected_tables_list.item(i).text()
-            # Extract just the table name (remove database prefix if present)
             table_name = table_path.split('.')[1] if '.' in table_path else table_path
             columns = self.db_browser.get_selected_columns(table_path)
             if columns:
                 config_data[table_name] = {"columns": ",".join(columns)}
         save_config(config_data)
         
+        # 6. Start Migration Thread
         self.migration_thread = MigrationThread(config)
         self.migration_thread.log_signal.connect(self.log)
         self.migration_thread.finished_signal.connect(self.migration_finished)
         self.migration_thread.error_signal.connect(self.migration_error)
 
-        
-        #1111
         # Connect new signals for progress bar
         self.migration_thread.set_progress_range_signal.connect(self.set_progress_range)
         self.migration_thread.progress_signal.connect(self.update_progress)
@@ -1618,13 +1653,11 @@ class MigrationGUI(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.progress_bar.setVisible(True)
 
-        #1111
         self.progress_bar.setValue(0)
         
         self.migration_thread.start()
         self.log("Migration started...")
         
-        # Update auto-start status if this was an auto-start
         if self.auto_start:
             self.auto_start_status.setText("Auto-start: Migration running")
 
@@ -1680,12 +1713,13 @@ class MigrationGUI(QMainWindow):
 
     def populate_db_dropdown(self):
         server = self.sql_server_input.text()
+        driver = self.get_full_driver_name() # Fetch the driver name
         if not server:
             QMessageBox.warning(self, "Input Error", "Please enter a SQL Server name first.")
             return
 
         try:
-            conn = connect_sql_server(server)  # Connect without a specific database
+            conn = connect_sql_server(driver, server)  # Connect without a specific database
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sys.databases WHERE database_id > 4")
             databases = [row[0] for row in cursor.fetchall()]
@@ -1726,8 +1760,10 @@ class MigrationGUI(QMainWindow):
             if not server or not db_name:
                 QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
                 return
+            
+            driver = self.get_full_driver_name()
 
-            conn = connect_sql_server(server, db_name)
+            conn = connect_sql_server(driver,server, db_name)
             cursor = conn.cursor()
             cursor.execute("SELECT is_cdc_enabled FROM sys.databases WHERE name = ?", (db_name,))
             result = cursor.fetchone()
@@ -1755,8 +1791,10 @@ class MigrationGUI(QMainWindow):
                 if not server or not db_name:
                     QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
                     return
+                
+                driver = self.get_full_driver_name()
 
-                sql_conn = connect_sql_server(server, db_name)
+                sql_conn = connect_sql_server(driver,server, db_name)
                 sql_cursor = sql_conn.cursor()
 
                 # Connect to MySQL
@@ -1872,9 +1910,11 @@ class MigrationGUI(QMainWindow):
                 if not server or not db_name:
                     QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
                     return
+                
+                driver = self.get_full_driver_name()
 
                 # Connect to SQL Server
-                sql_conn = connect_sql_server(server, db_name)
+                sql_conn = connect_sql_server(driver,server, db_name)
                 sql_cursor = sql_conn.cursor()
 
                 # --- Attempt to Connect to MySQL and Check for migration_log table ---
@@ -1983,7 +2023,9 @@ class MigrationGUI(QMainWindow):
                 QMessageBox.warning(self, "Error", "SQL Server or Database not set in config.json")
                 return
 
-            sql_conn = connect_sql_server(server, db_name)
+            driver = self.get_full_driver_name()
+
+            sql_conn = connect_sql_server(driver,server, db_name)
             sql_cursor = sql_conn.cursor()
 
             query = """
@@ -2045,7 +2087,9 @@ class MigrationGUI(QMainWindow):
                     QMessageBox.warning(self, "Error", "Please complete all connection settings in the Config tab.")
                     return
 
-                sql_conn = connect_sql_server(sql_server, source_db)
+                driver = self.get_full_driver_name()
+
+                sql_conn = connect_sql_server(driver, sql_server, source_db)
                 sql_cursor = sql_conn.cursor()
 
                 mysql_conn = mysql.connector.connect(
@@ -2183,7 +2227,9 @@ class MigrationGUI(QMainWindow):
                     mysql_pass = config.get("mysql_password")
                     mysql_db = config.get("mysql_db_name")
 
-                    sql_conn = connect_sql_server(sql_server, source_db)
+                    driver = self.get_full_driver_name()
+
+                    sql_conn = connect_sql_server(driver, sql_server, source_db)
                     sql_cursor = sql_conn.cursor()
                     mysql_conn, mysql_cursor = connect_mysql(mysql_db, mysql_host, mysql_user, mysql_pass)
 
