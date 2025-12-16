@@ -17,7 +17,7 @@ import msvcrt
 
 LOG_FILE = "migration.log"
 CONFIG_FILE = "config.json"
-RECONNECT_INTERVAL = 30  # 30 minutes
+RECONNECT_INTERVAL = 4  # 30 minutes
 
 # Create a QObject-based logger that can properly handle signals
 class Logger(QObject):
@@ -131,6 +131,7 @@ def connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword):
                 user=mysqluser,
                 password=mysqlpassword,
                 database=mysql_db_name,
+                pool_reset_session=True, 
             )
             logger.log("Connected to MySQL")
             cur = conn.cursor()
@@ -245,7 +246,7 @@ def create_mysql_table_if_not_exists(mysql_cursor, mysql_conn, sql_cursor, sql_s
 
 def do_full_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, pk_cols, last_pk, thread):
     # 1. زيادة حجم الدفعة لزيادة السرعة
-    chunk_size = 2000
+    chunk_size = 1000
 
     applied_changes = 0
 
@@ -627,7 +628,7 @@ class MigrationThread(QThread):
 
                 # periodic reconnect
                 if t.time() - last_reconnect >= RECONNECT_INTERVAL * 60:  # minutes → seconds
-                    self.log_signal.emit("Reconnecting to servers (30 min interval reached)...")
+                    self.log_signal.emit("Reconnecting to servers (4 min interval reached)...")
                     try: 
                         sql_server_conn.close()
                     except: 
@@ -1192,6 +1193,27 @@ class MigrationGUI(QMainWindow):
         
         # Set splitter sizes
         splitter.setSizes([400, 800])
+
+        # --- إنشاء علامة تبويب سجل الترحيل الجديدة (Migration Log Viewer) ---
+        log_viewer_tab = QWidget()
+        log_viewer_layout = QVBoxLayout(log_viewer_tab)
+        
+        # 1. زر التحديث
+        refresh_log_btn = QPushButton("Refresh Migration Log")
+        refresh_log_btn.clicked.connect(self.load_migration_log)
+        log_viewer_layout.addWidget(refresh_log_btn)
+        
+        # 2. جدول عرض البيانات
+        self.migration_log_table = QTableWidget()
+        self.migration_log_table.setColumnCount(4) # table_name, last_lsn, full_load_done
+        self.migration_log_table.setHorizontalHeaderLabels([
+            "Table Name", "Last LSN", "Last PK", "Full Load Done"
+        ])
+        self.migration_log_table.horizontalHeader().setStretchLastSection(True)
+        log_viewer_layout.addWidget(self.migration_log_table)
+        
+        # --- إضافة علامة التبويب إلى الـ QTabWidget ---
+        self.tabs.addTab(log_viewer_tab, "Migration Log Viewer") 
         
         # Control buttons
         control_layout = QHBoxLayout()
@@ -2213,7 +2235,7 @@ class MigrationGUI(QMainWindow):
             # Time for CDC Reactivation (03:05 AM - allowing 5 minutes for deactivation process)
             # We perform activation shortly after deactivation to minimize downtime.
             if now.hour == 3 and now.minute == 5: 
-                self.log("--- Daily CDC Reactivation triggered at 21:05 ---")
+                self.log("--- Daily CDC Reactivation triggered at 03:05 ---")
                 self.activate_cdc(show_message=False)
                 self.log("--- Daily CDC Reactivation complete ---")
                 
@@ -2452,6 +2474,61 @@ class MigrationGUI(QMainWindow):
                 except Exception as e:
                     self.log(f"Error resetting log for {table_name}: {e}")
                     QMessageBox.critical(self, "Error", f"Failed to reset log: {e}")
+
+    def load_migration_log(self):
+        self.log("Fetching Migration Log from MySQL...")
+        try:
+            config = load_config()
+            mysql_host = config.get("mysql_host")
+            mysql_user = config.get("mysql_user")
+            mysql_pass = config.get("mysql_password")
+            mysql_db = config.get("mysql_db_name")
+            
+            if not all([mysql_host, mysql_user, mysql_db]):
+                QMessageBox.warning(self, "Error", "Please fill in MySQL connection settings first.")
+                return
+
+            # استخدام الدالة العامة للاتصال بـ MySQL
+            mysql_conn, mysql_cursor = connect_mysql(mysql_db, mysql_host, mysql_user, mysql_pass)
+            
+            # جلب البيانات من جدول migration_log
+            mysql_cursor.execute("SELECT table_name, last_lsn, last_pk, full_load_done FROM migration_log")
+            results = mysql_cursor.fetchall()
+            
+            mysql_conn.close()
+
+            # --- عرض البيانات في الجدول ---
+            self.migration_log_table.setRowCount(len(results))
+            
+            for row_index, row_data in enumerate(results):
+                table_name, last_lsn, last_pk, full_load_done = row_data
+                
+                # عرض اسم الجدول
+                self.migration_log_table.setItem(row_index, 0, QTableWidgetItem(str(table_name)))
+                
+                # عرض LSN (نقوم بتحويله إلى تنسيق Hex/String لقراءة أسهل)
+                # LSN هو نوع BINARY(10) في MySQL، يجب التعامل معه حسب كيفية تخزينه
+                if last_lsn:
+                    # افتراضًا أن LSN يتم تخزينه كـ HEX في MySQL (يجب التحقق من تنسيق التخزين)
+                    lsn_display = last_lsn.hex() if isinstance(last_lsn, bytes) else str(last_lsn)
+                else:
+                    lsn_display = "N/A"
+                    
+                self.migration_log_table.setItem(row_index, 1, QTableWidgetItem(lsn_display))
+                
+                # 3. عرض قيمة last_pk في العمود 2 (العمود الجديد)
+                pk_display = str(last_pk) if last_pk is not None else "N/A"
+                self.migration_log_table.setItem(row_index, 2, QTableWidgetItem(pk_display)) # <-- العمود 2
+                
+                # 4. نقل عرض Full Load Done إلى العمود 3
+                full_load_status = "Done (1)" if full_load_done == 1 else "Pending (0)"
+                self.migration_log_table.setItem(row_index, 3, QTableWidgetItem(full_load_status)) # <-- العمود 3
+
+            self.log("Migration Log loaded successfully.")
+            
+        except Exception as e:
+            self.log(f"Error loading migration log: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load migration log: {e}")
 
 
 def main():
