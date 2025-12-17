@@ -501,10 +501,33 @@ def do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, 
 
 def migrate_table(sql_cursor, mysql_cursor, mysql_conn, sql_server_conn, table, config):
     logger.log(f"Starting migration for table {table}...")
+
+    # NEW: Fetch actual SQL Server data types and lengths
+    sql_cursor.execute(f"""
+        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH 
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_NAME = '{table}'
+        ORDER BY ORDINAL_POSITION
+    """)
     
-    # Use the table name directly (database context is already set in the connection)
-    sql_cursor.execute(f"SELECT TOP 0 * FROM {table}")
-    columns = [(col[0], col[1].__name__) for col in sql_cursor.description]
+    raw_data = sql_cursor.fetchall()
+    columns = []
+    
+    for row in raw_data:
+        col_name = row[0]
+        data_type = row[1]
+        max_len = row[2]
+        
+        # SQL Server identifies (max) as -1 for nvarchar, varchar, and varbinary
+        if max_len == -1:
+            data_type = f"{data_type}max"
+            
+        columns.append((col_name, data_type))
+
+
+    # # Use the table name directly (database context is already set in the connection)
+    # sql_cursor.execute(f"SELECT TOP 0 * FROM {table}")
+    # columns = [(col[0], col[1].__name__) for col in sql_cursor.description]
 
     if table not in config:
         # If we don't have a saved config, use all columns
@@ -596,9 +619,25 @@ class MigrationThread(QThread):
                             )
                             mysql_conn.commit()
                             
-                        # Get column names for migration
-                        sql_cursor.execute(f"SELECT TOP 0 * FROM {table}")
-                        columns = [(col[0], col[1].__name__) for col in sql_cursor.description]
+                        # # Get column names for migration
+                        # sql_cursor.execute(f"SELECT TOP 0 * FROM {table}")
+                        # columns = [(col[0], col[1].__name__) for col in sql_cursor.description]
+
+                        # Inside MigrationThread.run loop:
+                        sql_cursor.execute(f"""
+                            SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH 
+                            FROM INFORMATION_SCHEMA.COLUMNS 
+                            WHERE TABLE_NAME = '{table}'
+                        """)
+                        raw_columns = sql_cursor.fetchall()
+                        columns = []
+                        for row in raw_columns:
+                            c_name, c_type, c_len = row
+                            if c_len == -1:
+                                c_type = f"{c_type}max"
+                            columns.append((c_name, c_type))
+
+                        
                         if table not in config_data:
                             col_names = [col[0] for col in columns]
                         else:
