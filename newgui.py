@@ -88,7 +88,7 @@ def map_type(sql_type):
     
     # التعامل مع النصوص (الحل لمشكلة TEXT)
     if "max" in sql_type or "text" in sql_type: # إذا كان النوع MAX
-        return "LONGTEXT"
+        return "TEXT"
     if "nvarchar" in sql_type or "varchar" in sql_type or "nchar" in sql_type:
         return "VARCHAR(255)"
 
