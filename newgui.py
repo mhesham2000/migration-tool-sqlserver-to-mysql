@@ -17,7 +17,7 @@ import msvcrt
 
 LOG_FILE = "migration.log"
 CONFIG_FILE = "config.json"
-RECONNECT_INTERVAL = 4  # 30 minutes
+RECONNECT_INTERVAL = 5  # 30 minutes
 
 # Create a QObject-based logger that can properly handle signals
 class Logger(QObject):
@@ -67,22 +67,31 @@ def convert_value(val):
 
 def map_type(sql_type):
     sql_type = sql_type.lower()
+    
+    # التعامل مع الأنواع الرقمية
     if "int" in sql_type:
         return "INT"
-    if "decimal" in sql_type or "numeric" in sql_type:
+    if "decimal" in sql_type or "numeric" in sql_type or "money" in sql_type:
         return "DECIMAL(18,4)"
     if "float" in sql_type or "real" in sql_type:
         return "DOUBLE"
     if "bit" in sql_type:
         return "TINYINT(1)"
-    if "date" in sql_type:
-        return "DATE"
-    if "time" in sql_type:
-        return "TIME"
+        
+    # التعامل مع التاريخ والوقت
+    if "datetime2" in sql_type: # دعم النوع المحدث في SQL Server
+        return "DATETIME(6)"
     if "datetime" in sql_type or "smalldatetime" in sql_type:
         return "DATETIME"
-    if "char" in sql_type or "text" in sql_type or "nchar" in sql_type or "nvarchar" in sql_type:
+    if "date" in sql_type:
+        return "DATE"
+    
+    # التعامل مع النصوص (الحل لمشكلة TEXT)
+    if "max" in sql_type or "text" in sql_type: # إذا كان النوع MAX
+        return "LONGTEXT"
+    if "nvarchar" in sql_type or "varchar" in sql_type or "nchar" in sql_type:
         return "VARCHAR(255)"
+
     return "TEXT"
 
 def connect_sql_server(driver, server, database=None):
@@ -628,7 +637,7 @@ class MigrationThread(QThread):
 
                 # periodic reconnect
                 if t.time() - last_reconnect >= RECONNECT_INTERVAL * 60:  # minutes → seconds
-                    self.log_signal.emit("Reconnecting to servers (4 min interval reached)...")
+                    self.log_signal.emit("Reconnecting to servers (5 min interval reached)...")
                     try: 
                         sql_server_conn.close()
                     except: 
@@ -2003,12 +2012,20 @@ class MigrationGUI(QMainWindow):
                     for table in tables:
                         try:
                             # get primary key
+                            # sql_cursor.execute(f"""
+                            #     SELECT COLUMN_NAME 
+                            #     FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                            #     WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+                            #     AND TABLE_NAME='{table}'
+                            # """)
+
+                            # get primary key
                             sql_cursor.execute(f"""
-                                SELECT COLUMN_NAME 
-                                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                                WHERE TABLE_NAME='{table}'
+                                EXEC sp_pkeys '{table}'
                             """)
-                            pk_cols = [row[0] for row in sql_cursor.fetchall()]
+
+
+                            pk_cols = [row[3] for row in sql_cursor.fetchall()]
                             
                             if not pk_cols:
                                 # fallback to the first column
