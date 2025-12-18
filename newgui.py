@@ -361,7 +361,6 @@ def do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, 
     )
     result = sql_cursor.fetchall()
     if not result:
-        # logger.log(f"CDC not enabled for table {table}. Skipping incremental...")
         return False
 
     capture_instance = result[0][0]
@@ -374,129 +373,74 @@ def do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, 
     row = mysql_cursor.fetchone()
     last_lsn = row[0] if row else None
 
-    if not last_lsn:
-        mysql_cursor.execute("""
-            INSERT INTO `migration_log` (`table_name`, `last_lsn`)
-            VALUES (%s, %s)
-            ON DUPLICATE KEY UPDATE `last_lsn`=%s
-        """, (table, max_lsn, max_lsn))
-        mysql_conn.commit()
+    if not last_lsn or last_lsn == max_lsn:
+        # إذا لم يوجد LSN سابق أو لا توجد تغييرات جديدة
+        if not last_lsn:
+            mysql_cursor.execute("INSERT INTO `migration_log` (`table_name`, `last_lsn`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `last_lsn`=%s", (table, max_lsn, max_lsn))
+            mysql_conn.commit()
         return False
 
-    if last_lsn == max_lsn:
-        # لا توجد تغييرات جديدة
-        return False
-
-    # 3. جلب التغييرات
+    # 3. جلب التغييرات من SQL Server
     cdc_query = f"SELECT * FROM cdc.fn_cdc_get_all_changes_{capture_instance}(?, ?, ?)"
     try:
         sql_cursor.execute(cdc_query, (last_lsn, max_lsn, 'all'))
         rows = sql_cursor.fetchall()
     except Exception as e:
-        # أحياناً يكون LSN القديم قد تم حذفه من SQL Server (Cleaned up)
-        logger.log(f"CDC Error (LSN mismatch?): {e}. Reseting LSN to current max.")
-        mysql_cursor.execute("UPDATE `migration_log` SET `last_lsn`=%s WHERE `table_name`=%s", (max_lsn, table))
-        mysql_conn.commit()
+        logger.log(f"CDC Error on table {table}: {e}")
         return False
 
     total_changes = len(rows)
-    thread.set_progress_range_signal.emit(0, total_changes)
+    if total_changes == 0:
+        return False
 
-    if not rows:
-        return False # No rows returned
+    thread.set_progress_range_signal.emit(0, total_changes)
 
     # 4. تحضير جمل SQL
     placeholders = ','.join(['%s'] * len(col_names))
     update_clause = ','.join([f"`{c}`=VALUES(`{c}`)" for c in col_names if c not in pk_cols])
     
-    # جملة الإضافة/التعديل
-    upsert_sql = (
-        f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in col_names)}) "
-        f"VALUES ({placeholders}) "
-        f"ON DUPLICATE KEY UPDATE {update_clause}"
-    )
-    
-    # جملة الحذف
-    where_clause = ' AND '.join([f"`{col}`=%s" for col in pk_cols])
-    delete_sql = f"DELETE FROM `{table}` WHERE {where_clause}"
+    upsert_sql = f"INSERT INTO `{table}` ({', '.join(f'`{c}`' for c in col_names)}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_clause}"
+    delete_sql = f"DELETE FROM `{table}` WHERE {' AND '.join([f'`{c}`=%s' for c in pk_cols])}"
 
-    # 5. معالجة الدفعات بذكاء (Smart Batching)
-    upsert_batch = []
-    delete_batch = []
+    # 5. معالجة البيانات صف بصف مع آلية إعادة المحاولة
     processed_count = 0
-
-    def flush_upserts():
-        if upsert_batch:
-            try:
-                mysql_cursor.executemany(upsert_sql, upsert_batch)
-                upsert_batch.clear()
-            except Exception as e:
-                logger.log(f"Error executing upsert batch: {e}")
-
-    def flush_deletes():
-        if delete_batch:
-            try:
-                mysql_cursor.executemany(delete_sql, delete_batch)
-                delete_batch.clear()
-            except Exception as e:
-                logger.log(f"Error executing delete batch: {e}")
-
-    for i, row in enumerate(rows):
+    for row in rows:
         if not thread.running: break
 
         operation = getattr(row, '__$operation', 2)
-        
-        # تحويل البيانات
         row_dict = {col: convert_value(getattr(row, col)) for col in col_names if hasattr(row, col)}
-
-        if operation == 1:  # Delete
-            # يجب تنفيذ أي إضافات معلقة أولاً للحفاظ على الترتيب
-            flush_upserts()
-            
-            # تجهيز مفاتيح الحذف
-            pk_values = tuple(row_dict[col] for col in pk_cols)
-            delete_batch.append(pk_values)
-            
-        else:  # Insert (2) or Update (4)
-            # يجب تنفيذ أي حذوفات معلقة أولاً
-            flush_deletes()
-            
-            # تجهيز بيانات الصف
-            row_values = tuple(row_dict[c] for c in col_names)
-            upsert_batch.append(row_values)
+        
+        # محاولة تنفيذ الصف (مع إعادة المحاولة في حال فشل الاتصال)
+        retries = 3
+        while retries > 0:
+            try:
+                if operation == 1:  # Delete
+                    pk_values = tuple(row_dict[c] for c in pk_cols)
+                    mysql_cursor.execute(delete_sql, pk_values)
+                else:  # Insert (2) or Update (4)
+                    row_values = tuple(row_dict[c] for c in col_names)
+                    mysql_cursor.execute(upsert_sql, row_values)
+                
+                mysql_conn.commit()
+                break # نجحت العملية، اخرج من حلقة الـ while
+                
+            except (mysql.connector.Error, pyodbc.Error) as e:
+                retries -= 1
+                logger.log(f"Error on table {table}, PK={row_dict.get(pk_cols[0])}: {e}. Retries left: {retries}")
+                t.sleep(2) # انتظار بسيط قبل إعادة المحاولة
+                if retries == 0:
+                    raise e # إذا انتهت المحاولات، ارفع الخطأ ليتم التعامل معه في Thread الرئيسي
 
         processed_count += 1
+        thread.progress_signal.emit(processed_count)
         
-        # تنفيذ الدفعات عند الوصول لحجم معين (مثلاً كل 1000 صف) لتفادي استهلاك الذاكرة
-        if len(upsert_batch) >= 1:
-            flush_upserts()
-            thread.progress_signal.emit(processed_count)
-            logger.log(f"Table {table} Insert row with PK={row_dict[pk_cols[0]]}")
+        # طباعة سجل لكل صف (اختياري، تم تفعيله بناءً على رغبتك في مراقبة الصفوف)
+        logger.log(f"Table {table}: Processed row with PK={row_dict.get(pk_cols[0])}")
 
-            mysql_conn.commit()
-            
-        if len(delete_batch) >= 1:
-            flush_deletes()
-            thread.progress_signal.emit(processed_count)
-            mysql_conn.commit()
-
-    # تنفيذ المتبقي
-    flush_upserts()
-    flush_deletes()
+    # 6. تحديث LSN النهائي
+    mysql_cursor.execute("UPDATE `migration_log` SET `last_lsn`=%s WHERE `table_name`=%s", (max_lsn, table))
     mysql_conn.commit()
-
-    if processed_count > 0:
-        logger.log(f"{table} Incremental: Processed {processed_count} changes (Batch Mode).")
-
-    # تحديث LSN في النهاية
-    mysql_cursor.execute("""
-        INSERT INTO `migration_log` (`table_name`, `last_lsn`)
-        VALUES (%s, %s)
-        ON DUPLICATE KEY UPDATE `last_lsn`=%s
-    """, (table, max_lsn, max_lsn))
-    mysql_conn.commit()
-
-    thread.progress_signal.emit(total_changes)
+    
     return True
 
 def migrate_table(sql_cursor, mysql_cursor, mysql_conn, sql_server_conn, table, config):
@@ -572,135 +516,100 @@ class MigrationThread(QThread):
         
     def run(self):
         try:
+            # 1. جلب الإعدادات الأساسية من الواجهة
             source_db = self.config['source_db']
             sql_server = self.config['sql_server']
-            sql_driver = self.config['sql_driver'] # <--- MUST BE PRESENT
+            sql_driver = self.config['sql_driver']
             mysqlhost = self.config['mysql_host']
             mysqluser = self.config['mysql_user']
             mysqlpassword = self.config['mysql_password']
-            tables = [t.strip() for t in self.config['tables'].split(',')]
             mysql_db_name = self.config['mysql_db_name']
+            tables = [t.strip() for t in self.config['tables'].split(',')]
             
             self.log_signal.emit("Starting migration process...")
             
-            # Connect to the specific database
+            # 2. إنشاء الاتصالات الأولية
             sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db)
             sql_cursor = sql_server_conn.cursor()
             mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
             ensure_migration_log_table(mysql_cursor, mysql_conn)
             
-            config_data = load_config()
-            last_reconnect = t.time()
+            last_reconnect_time = t.time()
             attempt = 0
             
             while self.running:
                 any_changes = False
+                config_data = load_config() # تحديث الإعدادات في كل دورة
+                
                 for table in tables:
-                    if not self.running:
-                        break
+                    if not self.running: break
                         
-                    # try:
-                    #     # Use just the table name (database context is already set)
-                    #     changed = migrate_table(sql_cursor, mysql_cursor, mysql_conn, sql_server_conn, table, config_data)
-                    #     if changed:
-                    #         any_changes = True
-
                     try:
-                        # Get table information from the migration log
+                        # جلب معلومات الجدول والتحقق من حالة الـ Full Load
                         mysql_cursor.execute("SELECT `last_pk`, `full_load_done` FROM `migration_log` WHERE `table_name`=%s", (table,))
                         row = mysql_cursor.fetchone()
+                        
                         if row:
                             last_pk, full_load_done = row
                         else:
                             last_pk, full_load_done = None, 0
-                            mysql_cursor.execute(
-                                "INSERT INTO `migration_log` (`table_name`, `last_pk`, `full_load_done`) VALUES (%s, %s, %s)",
-                                (table, None, 0)
-                            )
+                            mysql_cursor.execute("INSERT INTO `migration_log` (`table_name`, `last_pk`, `full_load_done`) VALUES (%s, %s, %s)", (table, None, 0))
                             mysql_conn.commit()
-                            
-                        # # Get column names for migration
-                        # sql_cursor.execute(f"SELECT TOP 0 * FROM {table}")
-                        # columns = [(col[0], col[1].__name__) for col in sql_cursor.description]
 
-                        # Inside MigrationThread.run loop:
-                        sql_cursor.execute(f"""
-                            SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH 
-                            FROM INFORMATION_SCHEMA.COLUMNS 
-                            WHERE TABLE_NAME = '{table}'
-                        """)
+                        # جلب تفاصيل الأعمدة من SQL Server
+                        sql_cursor.execute(f"SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table}'")
                         raw_columns = sql_cursor.fetchall()
-                        columns = []
-                        for row in raw_columns:
-                            c_name, c_type, c_len = row
-                            if c_len == -1:
-                                c_type = f"{c_type}max"
-                            columns.append((c_name, c_type))
-
+                        columns = [(r[0], f"{r[1]}max" if r[2] == -1 else r[1]) for r in raw_columns]
                         
-                        if table not in config_data:
-                            col_names = [col[0] for col in columns]
-                        else:
-                            col_names = resolve_columns([col[0] for col in columns], config_data[table]["columns"])
-                        
+                        # تحديد الأعمدة المختارة
+                        col_names = resolve_columns([c[0] for c in columns], config_data.get(table, {}).get("columns", "*"))
                         pk_cols = get_primary_keys(sql_cursor, table, columns)
                         
-                        # Perform full load if not completed
+                        # --- المرحلة الأولى: Full Load (إذا لم يكتمل) ---
                         if full_load_done == 0:
-                            logger.log(f"Table {table} created in MySQL. Performing full load...")
+                            self.log_signal.emit(f"Table {table}: Starting Full Load...")
                             create_mysql_table_if_not_exists(mysql_cursor, mysql_conn, sql_cursor, sql_server_conn, table, columns, pk_cols, col_names)
                             do_full_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, pk_cols, last_pk, self)
                         
-                        # Always perform incremental load
+                        # --- المرحلة الثانية: Incremental Load (صف بصف مع Retry) ---
                         changed = do_incremental_load(sql_cursor, mysql_cursor, mysql_conn, table, col_names, pk_cols, self)
                         if changed:
                             any_changes = True
-                            
-                    except (pyodbc.Error, mysql.connector.Error) as e:
-                        error_msg = f"Error with table {table}: {e}. Retrying connections..."
-                        self.log_signal.emit(error_msg)
-                        try: 
+
+                    except Exception as e:
+                        # في حالة حدوث أي خطأ (فشل الـ Retry أو انقطاع مفاجئ)
+                        self.log_signal.emit(f"Error with table {table}: {e}. Reconnecting...")
+                        try:
                             sql_server_conn.close()
-                        except: 
-                            pass
-                        try: 
                             mysql_conn.close()
-                        except: 
-                            pass
-                        # Reconnect to the specific database
-                        sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db) # <--- PASS DRIVER
+                        except: pass
+                        
+                        t.sleep(5)
+                        # إعادة إنشاء الاتصالات
+                        sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db)
                         sql_cursor = sql_server_conn.cursor()
                         mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
                         ensure_migration_log_table(mysql_cursor, mysql_conn)
-                        continue
+                        break # البدء من جديد بالاتصالات الجديدة
 
-                # periodic reconnect
-                if t.time() - last_reconnect >= RECONNECT_INTERVAL * 60:  # minutes → seconds
-                    self.log_signal.emit("Reconnecting to servers (5 min interval reached)...")
-                    try: 
+                # 3. منطق إعادة الاتصال الدوري (كل 5 دقائق حسب كودك الأصلي)
+                if t.time() - last_reconnect_time >= RECONNECT_INTERVAL * 60:
+                    self.log_signal.emit("Periodic reconnect (Interval reached)...")
+                    try:
                         sql_server_conn.close()
-                    except: 
-                        pass
-                    try: 
                         mysql_conn.close()
-                    except: 
-                        pass
-                    # Reconnect to the specific database
-                    sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db) # <--- PASS DRIVER
+                    except: pass
+                    sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db)
                     sql_cursor = sql_server_conn.cursor()
-                    self.log_signal.emit("Reconnected to SQL Server")
                     mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
-                    self.log_signal.emit("Reconnected to MySQL")
-                    ensure_migration_log_table(mysql_cursor, mysql_conn)
-                    last_reconnect = t.time()
+                    last_reconnect_time = t.time()
 
-                self.log_signal.emit("Cycle complete.")
-
+                # 4. منطق الـ Sleep والـ Backoff
                 if any_changes:
                     attempt = 0
-                    self.log_signal.emit("Sleeping 5 seconds (changes applied)...")
-                    self.sleep(5)
+                    self.msleep(5000) # انتظار 5 ثوانٍ إذا كانت هناك تغييرات
                 else:
+                    self.log_signal.emit("No changes found. Waiting...")
                     attempt = self.backoff_sleep(attempt)
                     
         except Exception as e:
