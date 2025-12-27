@@ -34,7 +34,7 @@ For most devices, it is recommended to install the **arm64-v8a** version of the 
 * **OS:** Windows (preferred) or Linux.
 * **Python:** 3.8+
 * **Database Drivers:**
-    * [ODBC Driver 17 for SQL Server](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server).
+    * [ODBC Driver for SQL Server](https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server).
 * **Source Database:** SQL Server (Standard/Enterprise/Developer).
 * **Destination Database:** MySQL 5.7 or 8.0+.
 
