@@ -143,15 +143,15 @@ def connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword):
                 database=mysql_db_name,
                 connect_timeout=5,
                 autocommit=True,  # Enable autocommit for immediate effect
-                pool_reset_session=True, 
+
             )
             
-            if conn.is_connected():
-                cur = conn.cursor()
-                cur.execute(f"CREATE DATABASE IF NOT EXISTS `{mysql_db_name}`")
-                cur.execute(f"USE `{mysql_db_name}`")
-                logger.log("Connected to MySQL")
-                return conn, cur
+            if conn and conn.is_connected():
+                    cur = conn.cursor()
+                    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{mysql_db_name}`")
+                    cur.execute(f"USE `{mysql_db_name}`")
+                    logger.log("Connected to MySQL")
+                    return conn, cur
         except Exception as e:
             logger.log(f"MySQL connection failed: {e}. Retrying in 5 sec...") # Simplified log message
             if conn:
@@ -1601,6 +1601,7 @@ class MigrationGUI(QMainWindow):
         mysqlpassword = self.mysql_pass_input.text()
         mysql_db_name = self.mysql_db_input.text()
         
+        
         tables = []
         source_db = ""
 
@@ -1640,9 +1641,14 @@ class MigrationGUI(QMainWindow):
             sql_cursor = sql_server_conn.cursor()
             sql_server_conn.close() # Close test connection
 
+
             # Test MySQL connection
+
+            # mysql_conn = None
+            # mysql_cursor = None
             mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
             if not mysql_conn:
+            # if mysql_conn and hasattr(mysql_conn, 'is_connected') and mysql_conn.is_connected():
                 QMessageBox.critical(self, "Connection Error", "Failed to connect to MySQL. Please check your credentials.")
                 return
             mysql_conn.close() # Close test connection
