@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QListWidget, QGroupBox, QCheckBox, QMessageBox, QProgressBar,
                              QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QComboBox,
                              QTreeWidget, QTreeWidgetItem, QAbstractItemView, QGridLayout, QToolBar,QSystemTrayIcon, QMenu)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer,QCoreApplication
 from PyQt5.QtGui import QFont, QPalette, QColor, QIcon,QBrush 
 import pyodbc
 import mysql.connector
@@ -134,22 +134,35 @@ def connect_sql_server(driver, server, database=None):
 
 def connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword):
     while True: # Changed from 'for attempt in range(max_retries):'
+        conn = None
         try:
             conn = mysql.connector.connect(
                 host=mysqlhost,
                 user=mysqluser,
                 password=mysqlpassword,
                 database=mysql_db_name,
+                connect_timeout=5,
+                autocommit=True,  # Enable autocommit for immediate effect
                 pool_reset_session=True, 
             )
-            logger.log("Connected to MySQL")
-            cur = conn.cursor()
-            cur.execute(f"CREATE DATABASE IF NOT EXISTS `{mysql_db_name}`")
-            cur.execute(f"USE `{mysql_db_name}`")
-            return conn, cur
+            
+            if conn.is_connected():
+                cur = conn.cursor()
+                cur.execute(f"CREATE DATABASE IF NOT EXISTS `{mysql_db_name}`")
+                cur.execute(f"USE `{mysql_db_name}`")
+                logger.log("Connected to MySQL")
+                return conn, cur
         except Exception as e:
             logger.log(f"MySQL connection failed: {e}. Retrying in 5 sec...") # Simplified log message
-            t.sleep(5)
+            if conn:
+                try: conn.close()
+                except: pass
+            
+            # منع تهنيج الواجهة أثناء الانتظار (إصلاح تجميد البرنامج)
+            for _ in range(50): 
+                QCoreApplication.processEvents() # معالجة أحداث الواجهة أثناء الـ Sleep
+                t.sleep(0.1)
+
     
     # If all attempts fail, log and return None
     logger.log("Failed to connect to MySQL after multiple attempts. Please check your credentials.")
@@ -808,6 +821,10 @@ class DatabaseBrowser(QTreeWidget):
 class MigrationGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.is_scheduler_running = False
+        self.daily_task_done = False  # لضمان تنفيذ الدورة مرة واحدة فقط يومياً
+        self.pending_deactivate = False # إشارة بوجوب التعطيل أولاً
+        self.step1_deactivate_done = False
         self.migration_thread = None
         self.sql_conn = None
         self.sql_cursor = None
@@ -1569,6 +1586,11 @@ class MigrationGUI(QMainWindow):
         except Exception as e:
             self.log(f"MySQL connection test: FAILED - {str(e)}")
             QMessageBox.warning(self, "Connection Test", f"MySQL connection failed: {str(e)}")
+
+        finally:
+            if mysql_conn and mysql_conn.is_connected():
+                mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                self.log("MySQL connection closed safely.")
             
     def start_migration(self):
         # 1. Get configuration details from GUI
@@ -1628,6 +1650,11 @@ class MigrationGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", f"Failed to establish initial connections: {str(e)}")
             return
+        
+        finally:
+            if mysql_conn and mysql_conn.is_connected():
+                mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                self.log("MySQL connection closed safely.")
 
         # 5. Assemble Configuration for Thread
         config = {
@@ -1912,6 +1939,11 @@ class MigrationGUI(QMainWindow):
                 if sql_conn: sql_conn.close()
                 if mysql_conn: mysql_conn.close()
 
+            finally:
+                if mysql_conn and mysql_conn.is_connected():
+                    mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                    self.log("MySQL connection closed safely.")
+
 
     def deactivate_cdc(self, show_message=True): # New argument
             try:
@@ -2031,6 +2063,10 @@ class MigrationGUI(QMainWindow):
                     sql_conn.close()
                 if mysql_conn:
                     mysql_conn.close()
+            finally:
+                if mysql_conn and mysql_conn.is_connected():
+                    mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                    self.log("MySQL connection closed safely.")
 
 
     def show_cdc_table_sizes(self):
@@ -2179,59 +2215,95 @@ class MigrationGUI(QMainWindow):
                 self.row_counts_table.setRowCount(0) # Clear table on error
                 QMessageBox.critical(self, "Error", f"An error occurred: {e}")
 
-    def run_daily_cdc_schedule(self):
-            """
-            Runs daily CDC deactivation and reactivation at specific times.
-            - Deactivate: 03:00 AM (03:00)
-            - Activate: 10:00 AM (22:00) - Assuming 1 hour downtime for maintenance, adjust as needed.
-            """
-            now = datetime.now()
+            finally:
+                if mysql_conn and mysql_conn.is_connected():
+                    mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                    self.log("MySQL connection closed safely.")
+
+    # def run_daily_cdc_schedule(self):
+    #         """
+    #         Runs daily CDC deactivation and reactivation at specific times.
+    #         - Deactivate: 03:00 AM (03:00)
+    #         - Activate: 3:05 AM (2:05) - Assuming 5 minutes downtime for maintenance, adjust as needed.
+    #         """
+    #         if self.is_scheduler_running:
+    #             return
             
-            # Time for CDC Deactivation (03:00 AM)
-            if now.hour == 3 and now.minute == 0:
-                self.log("--- Daily CDC Deactivation triggered at 03:00 ---")
-                # Stop the continuous migration thread if it's running before disabling CDC
-                if self.migration_thread and self.migration_thread.running:
-                    self.stop_migration()
+    #         now = datetime.now()
+            
+    #         # Time for CDC Deactivation (03:00 AM)
+    #         if now.hour == 3 and now.minute == 0:
+    #             self.log("--- Daily CDC Deactivation triggered at 03:00 ---")
+    #             # Stop the continuous migration thread if it's running before disabling CDC
+    #             if self.migration_thread and self.migration_thread.running:
+    #                 self.stop_migration()
                     
-                self.deactivate_cdc(show_message=False)
-                self.log("--- Daily CDC Deactivation complete ---")
+    #             self.deactivate_cdc(show_message=False)
+    #             self.log("--- Daily CDC Deactivation complete ---")
                 
-            # Time for CDC Reactivation (03:05 AM - allowing 5 minutes for deactivation process)
-            # We perform activation shortly after deactivation to minimize downtime.
-            if now.hour == 3 and now.minute == 5: 
-                self.log("--- Daily CDC Reactivation triggered at 03:05 ---")
-                self.activate_cdc(show_message=False)
-                self.log("--- Daily CDC Reactivation complete ---")
+    #         # Time for CDC Reactivation (03:05 AM - allowing 5 minutes for deactivation process)
+    #         # We perform activation shortly after deactivation to minimize downtime.
+    #         if now.hour == 3 and now.minute == 5: 
+    #             self.log("--- Daily CDC Reactivation triggered at 03:05 ---")
+    #             self.activate_cdc(show_message=False)
+    #             self.log("--- Daily CDC Reactivation complete ---")
                 
-                # Restart the migration thread if it was running previously
-                if self.start_btn.isEnabled(): # Check if migration is not currently running
-                    self.start_migration() # This restarts the data sync
+    #             # Restart the migration thread if it was running previously
+    #             if self.start_btn.isEnabled(): # Check if migration is not currently running
+    #                 self.start_migration() # This restarts the data sync
 
 
-    def run_periodic_cdc_sync(self):
-            """
-            Executes the activate_cdc logic periodically to ensure schema consistency 
-            and CDC is active on all configured tables.
-            """
-            self.log("--- Starting periodic CDC sync and schema check (5-minute interval) ---")
-            
+    def run_daily_cdc_schedule(self):
+        if self.is_scheduler_running:
+            return
+
+        now = datetime.now()
+        
+        # 1. في تمام الساعة 3:00 (أو أي وقت بعدها حتى يتم التنفيذ)، نرفع راية البدء
+        if now.hour == 3 and now.minute == 0 and not self.pending_deactivate:
+            self.pending_deactivate = True
+            self.daily_task_done = False
+            self.log("--- Scheduled: Waiting for connection to Deactivate CDC ---")
+
+        # 2. إذا كانت هناك مهمة معلقة (pending) ولم تنتهِ دورة اليوم بعد
+        if self.pending_deactivate and not self.daily_task_done:
             try:
-                # We call the existing activate_cdc method
-                # It already contains the logic to:
-                # 1. Check MySQL connection.
-                # 2. Check current MySQL schema against config.json.
-                # 3. ALTER TABLE to add any missing columns.
-                # 4. Enable CDC on the database.
-                # 5. Enable CDC on all tables with the correct column list.
-                self.activate_cdc()
+                self.is_scheduler_running = True
+
+                if not self.step1_deactivate_done:
+                    # محاولة التعطيل أولاً (ستظل تحاول بفضل while True داخل connect_mysql)
+                    self.log("--- Step 1: Attempting to Deactivate CDC ---")
+                    if self.migration_thread and self.migration_thread.isRunning():
+                        self.stop_migration()
+                    
+                    # هذه الدالة لن تعود إلا بعد نجاح الاتصال وتنفيذ التعطيل
+                    self.deactivate_cdc(show_message=False)
+                    self.step1_deactivate_done = True # علامة نجاح الخطوة الأولى
+                    self.log("--- Step 1 Complete: CDC Deactivated ---")
                 
-                self.log("--- Periodic CDC sync and schema check completed ---")
+                # 3. بمجرد نجاح الخطوة الأولى، ننتقل فوراً للخطوة الثانية (التفعيل)
+                self.log("--- Step 2: Attempting to Reactivate CDC ---")
+                self.activate_cdc(show_message=False)
+                self.log("--- Step 2 Complete: CDC Reactivated ---")
+                
+                # إعادة تشغيل الهجرة
+                if self.start_btn.isEnabled():
+                    self.start_migration()
+                
+                # إنهاء الدورة بنجاح
+                self.pending_deactivate = False
+                self.daily_task_done = True
+                self.step1_deactivate_done = False # تصفر للمرة القادمة
+                self.log("--- Daily Sequential CDC Maintenance Finished Successfully ---")
 
             except Exception as e:
-                # Note: The activate_cdc function already has internal error handling (QMessageBox, log).
-                # This outer try/except is mainly for catching unexpected timer execution failures.
-                self.log(f"CRITICAL ERROR during periodic CDC sync: {e}")
+                self.log(f"Scheduler Error: {e}. Will retry current step in next cycle.")
+            finally:
+                self.is_scheduler_running = False
+
+        # تصفير الحالة في نهاية اليوم (مثلاً الساعة 4 صباحاً) لتستعد ليوم جديد
+        if now.hour == 4 and self.daily_task_done:
+            self.daily_task_done = False
 
 
     def sync_rows_by_pk(self, table_name):
@@ -2409,6 +2481,11 @@ class MigrationGUI(QMainWindow):
                     QMessageBox.critical(self, "Error", f"Failed to re-sync table {table_name}: {e}")
                     self.progress_bar.setVisible(False)
 
+                finally:
+                    if mysql_conn and mysql_conn.is_connected():
+                        mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                        self.log("MySQL connection closed safely.")
+
 
     def reset_migration_log(self, table_name):
             # تأكيد الحذف من المستخدم أولاً
@@ -2439,6 +2516,10 @@ class MigrationGUI(QMainWindow):
                 except Exception as e:
                     self.log(f"Error resetting log for {table_name}: {e}")
                     QMessageBox.critical(self, "Error", f"Failed to reset log: {e}")
+                finally:
+                    if mysql_conn and mysql_conn.is_connected():
+                        mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                        self.log("MySQL connection closed safely.")
 
     def load_migration_log(self):
         self.log("Fetching Migration Log from MySQL...")
@@ -2494,6 +2575,11 @@ class MigrationGUI(QMainWindow):
         except Exception as e:
             self.log(f"Error loading migration log: {e}")
             QMessageBox.critical(self, "Error", f"Failed to load migration log: {e}")
+
+        finally:
+            if mysql_conn and mysql_conn.is_connected():
+                mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
+                self.log("MySQL connection closed safely.")
 
 
 def main():
