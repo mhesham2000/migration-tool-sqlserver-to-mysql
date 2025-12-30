@@ -825,6 +825,7 @@ class MigrationGUI(QMainWindow):
         self.daily_task_done = False  # لضمان تنفيذ الدورة مرة واحدة فقط يومياً
         self.pending_deactivate = False # إشارة بوجوب التعطيل أولاً
         self.step1_deactivate_done = False
+        self.deactivation_finish_time = None
         self.migration_thread = None
         self.sql_conn = None
         self.sql_cursor = None
@@ -1937,6 +1938,7 @@ class MigrationGUI(QMainWindow):
                     QMessageBox.information(self, "Success", f"Schema synchronized and CDC enabled on database {db_name} and all configured tables")
                 
                 self.check_cdc_status()
+                return True
 
             except Exception as e:
                 self.log(f"Failed to activate CDC or synchronize schema: {e}")
@@ -1944,6 +1946,7 @@ class MigrationGUI(QMainWindow):
                     QMessageBox.critical(self, "Error", f"Failed to activate CDC or synchronize schema: {e}")
                 if sql_conn: sql_conn.close()
                 if mysql_conn: mysql_conn.close()
+                return False
 
             finally:
                 if mysql_conn and mysql_conn.is_connected():
@@ -2060,6 +2063,7 @@ class MigrationGUI(QMainWindow):
                     QMessageBox.information(self, "Success", status_msg)
                     
                 self.check_cdc_status()
+                return True
 
             except Exception as e:
                 self.log(f"Failed to deactivate CDC: {e}")
@@ -2069,6 +2073,7 @@ class MigrationGUI(QMainWindow):
                     sql_conn.close()
                 if mysql_conn:
                     mysql_conn.close()
+                return False
             finally:
                 if mysql_conn and mysql_conn.is_connected():
                     mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
@@ -2264,52 +2269,71 @@ class MigrationGUI(QMainWindow):
             return
 
         now = datetime.now()
-        
-        # 1. في تمام الساعة 3:00 (أو أي وقت بعدها حتى يتم التنفيذ)، نرفع راية البدء
-        if now.hour == 3 and now.minute == 0 and not self.pending_deactivate:
-            self.pending_deactivate = True
-            self.daily_task_done = False
-            self.log("--- Scheduled: Waiting for connection to Deactivate CDC ---")
 
-        # 2. إذا كانت هناك مهمة معلقة (pending) ولم تنتهِ دورة اليوم بعد
+        # 1. لحظة التشغيل عند الساعة 3:00
+        if now.hour == 3 and now.minute == 0 and not self.pending_deactivate and not self.daily_task_done:
+            self.pending_deactivate = True
+            self.step1_deactivate_done = False
+            self.log("--- Scheduled Maintenance Started at 03:00 ---")
+
         if self.pending_deactivate and not self.daily_task_done:
             try:
                 self.is_scheduler_running = True
-
+                
+                # الخطوة 1: التعطيل
                 if not self.step1_deactivate_done:
-                    # محاولة التعطيل أولاً (ستظل تحاول بفضل while True داخل connect_mysql)
-                    self.log("--- Step 1: Attempting to Deactivate CDC ---")
+                    self.log("Step 1: Deactivating CDC...")
                     if self.migration_thread and self.migration_thread.isRunning():
                         self.stop_migration()
+                        
+                        # --- إضافة 30 ثانية انتظار بعد stop_migration ---
+                        self.log("Waiting 30 seconds for thread and connections to clear...")
+                        for _ in range(300): # 300 * 0.1 = 30 seconds
+                            from PyQt5.QtCore import QCoreApplication
+                            QCoreApplication.processEvents()
+                            import time as t
+                            t.sleep(0.1)
                     
-                    # هذه الدالة لن تعود إلا بعد نجاح الاتصال وتنفيذ التعطيل
-                    self.deactivate_cdc(show_message=False)
-                    self.step1_deactivate_done = True # علامة نجاح الخطوة الأولى
-                    self.log("--- Step 1 Complete: CDC Deactivated ---")
-                
-                # 3. بمجرد نجاح الخطوة الأولى، ننتقل فوراً للخطوة الثانية (التفعيل)
-                self.log("--- Step 2: Attempting to Reactivate CDC ---")
-                self.activate_cdc(show_message=False)
-                self.log("--- Step 2 Complete: CDC Reactivated ---")
-                
-                # إعادة تشغيل الهجرة
-                if self.start_btn.isEnabled():
-                    self.start_migration()
-                
-                # إنهاء الدورة بنجاح
-                self.pending_deactivate = False
-                self.daily_task_done = True
-                self.step1_deactivate_done = False # تصفر للمرة القادمة
-                self.log("--- Daily Sequential CDC Maintenance Finished Successfully ---")
+                    # تنفيذ التعطيل بعد الانتظار
+                    if self.deactivate_cdc(show_message=False):
+                        self.step1_deactivate_done = True
 
+
+                # الخطوة 2: التفعيل (بعد مرور 2 دقائق من الخطوة 1)
+                if self.step1_deactivate_done:
+                    if self.activate_cdc(show_message=False):
+                        self.log("Step 2 Success: CDC Activated.")
+                        
+                        # --- إضافة 30 ثانية انتظار بعد نجاح activate_cdc ---
+                        self.log("Waiting 30 seconds before restarting migration...")
+                        for _ in range(300): 
+                            from PyQt5.QtCore import QCoreApplication
+                            QCoreApplication.processEvents()
+                            import time as t
+                            t.sleep(0.1)
+                        # إعادة تشغيل الهجرة
+                        self.log("Step 3: Restarting Migration...")
+                        if not self.migration_thread or not self.migration_thread.isRunning():
+                            self.start_migration()
+                        
+                        # إنهاء الدورة
+                        self.daily_task_done = True
+                        self.pending_deactivate = False
+                        self.deactivation_finish_time = None
+                        self.log("--- Full Sequence Completed Successfully ---")
+                    else:
+                        self.log("Step 2 Failed: Activation failed, will retry in next tick.")
+                    
             except Exception as e:
-                self.log(f"Scheduler Error: {e}. Will retry current step in next cycle.")
+                self.log(f"Maintenance Error: {e}")
             finally:
                 self.is_scheduler_running = False
 
-        # تصفير الحالة في نهاية اليوم (مثلاً الساعة 4 صباحاً) لتستعد ليوم جديد
+        # إعادة تصفير الأعلام لليوم التالي (الساعة 4 صباحاً)
         if now.hour == 4 and self.daily_task_done:
             self.daily_task_done = False
+            self.pending_deactivate = False
+            self.step1_deactivate_done = False
 
 
     def sync_rows_by_pk(self, table_name):
