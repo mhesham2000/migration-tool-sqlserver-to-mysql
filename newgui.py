@@ -94,43 +94,22 @@ def map_type(sql_type):
 
     return "TEXT"
 
-def connect_sql_server(driver, server, database=None):
+def connect_sql_server(driver, server, database=None, username=None, password=None):
     while True:
         try:
-            connection_string = f'DRIVER={{{driver}}};' \
-                               f'SERVER={server};'
-            
-            if database:
-                connection_string += f'DATABASE={database};'
-                
-            connection_string += 'Trusted_Connection=yes;'
-            
+            connection_string = f'DRIVER={{{driver}}};SERVER={server};'
+            if database: connection_string += f'DATABASE={database};'
+            if username and password:
+                connection_string += f'UID={username};PWD={password};'
+            else:
+                connection_string += 'Trusted_Connection=yes;'
             conn = pyodbc.connect(connection_string, timeout=5)
-            logger.log(f"Connected to SQL Server{' database ' + database if database else ''}")
+            logger.log(f"Connected to SQL Server (Auth: {'SQL' if username else 'Windows'})")
             return conn
         except Exception as e:
             logger.log(f"SQL Server connection failed: {e}. Retrying in 5 sec...")
             t.sleep(5)
 
-
-# def connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword):
-#     max_retries = 3
-#     for attempt in range(max_retries):
-#         try:
-#             conn = mysql.connector.connect(
-#                 host=mysqlhost,
-#                 user=mysqluser,
-#                 password=mysqlpassword,
-#                 database=mysql_db_name,
-#             )
-#             logger.log("Connected to MySQL")
-#             cur = conn.cursor()
-#             cur.execute(f"CREATE DATABASE IF NOT EXISTS `{mysql_db_name}`")
-#             cur.execute(f"USE `{mysql_db_name}`")
-#             return conn, cur
-#         except Exception as e:
-#             logger.log(f"MySQL connection failed: {e}. Retrying... (Attempt {attempt + 1}/{max_retries})")
-#             t.sleep(5)
 
 def connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword):
     while True: # Changed from 'for attempt in range(max_retries):'
@@ -542,7 +521,8 @@ class MigrationThread(QThread):
             self.log_signal.emit("Starting migration process...")
             
             # 2. إنشاء الاتصالات الأولية
-            sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db)
+            sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db,self.config.get('sql_user'), 
+                                     self.config.get('sql_password'))
             sql_cursor = sql_server_conn.cursor()
             mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
             ensure_migration_log_table(mysql_cursor, mysql_conn)
@@ -599,7 +579,8 @@ class MigrationThread(QThread):
                         
                         t.sleep(5)
                         # إعادة إنشاء الاتصالات
-                        sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db)
+                        sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db,self.config.get('sql_user'), 
+                                     self.config.get('sql_password'))
                         sql_cursor = sql_server_conn.cursor()
                         mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
                         ensure_migration_log_table(mysql_cursor, mysql_conn)
@@ -612,7 +593,8 @@ class MigrationThread(QThread):
                         sql_server_conn.close()
                         mysql_conn.close()
                     except: pass
-                    sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db)
+                    sql_server_conn = connect_sql_server(sql_driver, sql_server, source_db,self.config.get('sql_user'), 
+                                     self.config.get('sql_password'))
                     sql_cursor = sql_server_conn.cursor()
                     mysql_conn, mysql_cursor = connect_mysql(mysql_db_name, mysqlhost, mysqluser, mysqlpassword)
                     last_reconnect_time = t.time()
@@ -654,14 +636,21 @@ class DatabaseBrowser(QTreeWidget):
         self.sql_conn = None
         self.sql_cursor = None
         
-    def connect_to_sql_server(self, driver, server): 
+    def connect_to_sql_server(self, driver, server, user=None, pw=None): 
+        """
+        Connects the browser tree to SQL Server. 
+        Supports both Windows and SQL Authentication.
+        """
         try:
-            self.sql_conn = pyodbc.connect(
-                f'DRIVER={{{driver}}};'
-                f'SERVER={server};'
-                'Trusted_Connection=yes;',
-                timeout=5
-            )
+            # Build connection string based on presence of credentials
+            connection_string = f'DRIVER={{{driver}}};SERVER={server};'
+            
+            if user and pw:
+                connection_string += f'UID={user};PWD={pw};'
+            else:
+                connection_string += 'Trusted_Connection=yes;'
+
+            self.sql_conn = pyodbc.connect(connection_string, timeout=5)
             self.sql_cursor = self.sql_conn.cursor()
             self.load_databases()
             return True
@@ -968,6 +957,25 @@ class MigrationGUI(QMainWindow):
         sql_layout.addWidget(QLabel("SQL Server:"), 1, 0)
         self.sql_server_input = QLineEdit()
         sql_layout.addWidget(self.sql_server_input, 1, 1)
+
+        # NEW: Authentication Type Selection Row
+        sql_layout.addWidget(QLabel("Auth Type:"), 2, 0)
+        self.sql_auth_combo = QComboBox()
+        self.sql_auth_combo.addItems(["Windows Authentication", "SQL Server Authentication"])
+        self.sql_auth_combo.currentIndexChanged.connect(self.toggle_sql_auth_fields)
+        sql_layout.addWidget(self.sql_auth_combo, 2, 1)
+
+        # NEW: SQL Login Credentials Rows
+        sql_layout.addWidget(QLabel("SQL User:"), 3, 0)
+        self.sql_user_input = QLineEdit()
+        self.sql_user_input.setEnabled(False) # Disabled unless SQL Auth is chosen
+        sql_layout.addWidget(self.sql_user_input, 3, 1)
+
+        sql_layout.addWidget(QLabel("SQL Password:"), 4, 0)
+        self.sql_pass_input = QLineEdit()
+        self.sql_pass_input.setEchoMode(QLineEdit.Password)
+        self.sql_pass_input.setEnabled(False) # Disabled unless SQL Auth is chosen
+        sql_layout.addWidget(self.sql_pass_input, 4, 1)
         
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self.connect_to_sql_server)
@@ -1290,23 +1298,28 @@ class MigrationGUI(QMainWindow):
         """
         # We need to adapt the groupbox styling for the light theme
         if not is_dark_theme:
-            groupbox_style = """
-                QGroupBox {
-                    border: 1px solid #DEDEDE;
-                    border-radius: 5px;
-                    margin-top: 2ex;
-                }
-                QGroupBox::title {
-                    subcontrol-origin: margin;
-                    subcontrol-position: top left;
-                    padding: 0 3px;
-                    color: #555;
-                }
-            """
+            # groupbox_style = """
+            #     QGroupBox {
+            #         border: 1px solid #DEDEDE;
+            #         border-radius: 5px;
+            #         margin-top: 2ex;
+            #     }
+            #     QGroupBox::title {
+            #         subcontrol-origin: margin;
+            #         subcontrol-position: top left;
+            #         padding: 0 3px;
+            #         color: #555;
+            #     }
+            # """
+
+            groupbox_style = "QGroupBox { border: 1px solid #DEDEDE; border-radius: 5px; margin-top: 2ex; } QGroupBox::title { subcontrol-origin: margin; padding: 0 3px; }"
 
         self.findChild(QGroupBox, "SQL Server Connection").setStyleSheet(groupbox_style)
-        self.findChild(QGroupBox, "Selected Tables").setStyleSheet(groupbox_style)
         self.findChild(QGroupBox, "MySQL Connection").setStyleSheet(groupbox_style)
+
+        # self.findChild(QGroupBox, "SQL Server Connection").setStyleSheet(groupbox_style)
+        self.findChild(QGroupBox, "Selected Tables").setStyleSheet(groupbox_style)
+        # self.findChild(QGroupBox, "MySQL Connection").setStyleSheet(groupbox_style)
         
         # Tab widget styling - dynamically change for theme
         if is_dark_theme:
@@ -1391,6 +1404,11 @@ class MigrationGUI(QMainWindow):
             return False
             
         return True
+    
+    def toggle_sql_auth_fields(self):
+        is_sql_auth = self.sql_auth_combo.currentIndex() == 1
+        self.sql_user_input.setEnabled(is_sql_auth)
+        self.sql_pass_input.setEnabled(is_sql_auth)
         
     def auto_start_migration(self):
         """Automatically start migration if we have a valid config"""
@@ -1459,17 +1477,55 @@ class MigrationGUI(QMainWindow):
         self.selected_tables_list.clear()
         
     def connect_to_sql_server(self):
+        """
+        Handles the 'Connect' button click. Collects UI inputs and 
+        initializes the SQL Server browser.
+        """
         server = self.sql_server_input.text()
-        driver = self.get_full_driver_name() # USE HELPER
+        driver = self.get_full_driver_name() # Helper to get "ODBC Driver XX for SQL Server"
 
         if not server or not driver:
-            QMessageBox.warning(self, "Input Error", "Please enter a SQL Server name and select an ODBC Driver version.")
+            QMessageBox.warning(self, "Input Error", "Please enter a SQL Server name and ensure a driver is selected.")
             return
             
-        if self.db_browser.connect_to_sql_server(driver, server):
-            self.log(f"Connected to SQL Server: {server} using driver: {driver}")
+        # --- NEW: Extract Credentials from UI ---
+        # If the combo box is set to SQL Server Authentication (Index 1)
+        if self.sql_auth_combo.currentIndex() == 1:
+            user = self.sql_user_input.text()
+            pw = self.sql_pass_input.text()
+            
+            if not user or not pw:
+                QMessageBox.warning(self, "Input Error", "Please enter both SQL Username and Password.")
+                return
+        else:
+            # Using Windows Authentication (Trusted Connection)
+            user = None
+            pw = None
+            
+        # 1. Update the Database Browser with the new credentials
+        # We pass the user and pw to the browser's internal connection logic
+        if self.db_browser.connect_to_sql_server(driver, server, user, pw):
+            self.log(f"Connected to SQL Server: {server} using {'SQL Auth' if user else 'Windows Auth'}")
+            
+            # 2. Populate the Admin tab dropdown since we now have a valid connection
             self.populate_db_dropdown()
             
+            # 3. Enable related UI buttons
+            self.add_table_btn.setEnabled(True)
+            self.select_all_btn.setEnabled(True)
+            self.deselect_all_btn.setEnabled(True)
+        else:
+            # Error message is already handled inside db_browser.connect_to_sql_server
+            self.log(f"Connection attempt to {server} failed.")
+
+    # def connect_to_sql_server(self):
+    #     driver = f"ODBC Driver {self.sql_driver_version_combo.currentText()} for SQL Server"
+    #     user = self.sql_user_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
+    #     pw = self.sql_pass_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
+    #     if self.db_browser.connect_to_sql_server(driver, self.sql_server_input.text(), user, pw):
+    #         self.log("Connected to SQL Server browser.")
+
+
     def on_tables_selected(self, tables):
         # This method is called when tables are selected in the browser
         # We don't automatically add them to the list anymore
@@ -1488,6 +1544,9 @@ class MigrationGUI(QMainWindow):
                     self.sql_driver_version_combo.setCurrentIndex(index)
                     
                 self.sql_server_input.setText(config.get('sql_server', ''))
+                self.sql_auth_combo.setCurrentIndex(config.get('sql_auth_type', 0))
+                self.sql_user_input.setText(config.get('sql_user', ''))
+                self.sql_pass_input.setText(config.get('sql_password', ''))
                 self.mysql_host_input.setText(config.get('mysql_host', ''))
                 self.mysql_db_input.setText(config.get('mysql_db_name', ''))
                 self.mysql_user_input.setText(config.get('mysql_user', ''))
@@ -1526,6 +1585,9 @@ class MigrationGUI(QMainWindow):
             config = {
                 'sql_driver_version': self.sql_driver_version_combo.currentText(),
                 'sql_server': self.sql_server_input.text(),
+                'sql_auth_type': self.sql_auth_combo.currentIndex(),
+                'sql_user': self.sql_user_input.text() if self.sql_auth_combo.currentIndex() == 1 else "",
+                'sql_password': self.sql_pass_input.text() if self.sql_auth_combo.currentIndex() == 1 else "",
                 'mysql_host': self.mysql_host_input.text(),
                 'mysql_db_name': self.mysql_db_input.text(),
                 'mysql_user': self.mysql_user_input.text(),
@@ -1563,9 +1625,12 @@ class MigrationGUI(QMainWindow):
     def test_connections(self):
         server = self.sql_server_input.text()
         driver = self.get_full_driver_name()
+        # Get SQL credentials from UI
+        sql_user = self.sql_user_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
+        sql_pass = self.sql_pass_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
         # Test SQL Server connection
         try:
-            sql_conn = connect_sql_server(driver, server)
+            sql_conn = connect_sql_server(driver, server,None,sql_user, sql_pass)
             sql_conn.close()
             self.log("SQL Server connection test: SUCCESS")
         except Exception as e:
@@ -1601,6 +1666,10 @@ class MigrationGUI(QMainWindow):
         mysqluser = self.mysql_user_input.text()
         mysqlpassword = self.mysql_pass_input.text()
         mysql_db_name = self.mysql_db_input.text()
+
+        # If index is 1, it's SQL Server Authentication; otherwise, it's Windows Auth (None)
+        sql_user = self.sql_user_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
+        sql_pass = self.sql_pass_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
         
         
         tables = []
@@ -1638,8 +1707,7 @@ class MigrationGUI(QMainWindow):
         # 4. Test Connections
         try:
             # Test SQL Server connection (using the new driver parameter)
-            sql_server_conn = connect_sql_server(driver, server, source_db)
-            sql_cursor = sql_server_conn.cursor()
+            sql_server_conn = connect_sql_server(driver, server, source_db,sql_user, sql_pass)
             sql_server_conn.close() # Close test connection
 
 
@@ -1668,6 +1736,8 @@ class MigrationGUI(QMainWindow):
             'sql_driver': driver,
             'sql_server': server,
             'source_db': source_db,
+            'sql_user': sql_user,        # New: Credential passing
+            'sql_password': sql_pass,    # New: Credential passing
             'mysql_host': mysqlhost,
             'mysql_db_name': mysql_db_name,
             'mysql_user': mysqluser,
@@ -1677,6 +1747,11 @@ class MigrationGUI(QMainWindow):
         
         # Add column selections to config_data
         config_data = load_config()
+        # Ensure credentials and auth type are saved to the persistent config
+        config_data['sql_auth_type'] = self.sql_auth_combo.currentIndex()
+        config_data['sql_user'] = self.sql_user_input.text() if sql_user else ""
+        config_data['sql_password'] = self.sql_pass_input.text() if sql_pass else ""
+
         for i in range(self.selected_tables_list.count()):
             table_path = self.selected_tables_list.item(i).text()
             table_name = table_path.split('.')[1] if '.' in table_path else table_path
@@ -1765,7 +1840,10 @@ class MigrationGUI(QMainWindow):
             return
 
         try:
-            conn = connect_sql_server(driver, server)  # Connect without a specific database
+            # We use these to connect to the master/default context to list other databases
+            sql_user = self.sql_user_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
+            sql_pass = self.sql_pass_input.text() if self.sql_auth_combo.currentIndex() == 1 else None
+            conn = connect_sql_server(driver, server, None, sql_user, sql_pass)  # Connect without a specific database
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sys.databases WHERE database_id > 4")
             databases = [row[0] for row in cursor.fetchall()]
@@ -1809,7 +1887,11 @@ class MigrationGUI(QMainWindow):
             
             driver = self.get_full_driver_name()
 
-            conn = connect_sql_server(driver,server, db_name)
+            # --- NEW: Retrieve SQL credentials for maintenance tasks ---
+            sql_user = config.get("sql_user")
+            sql_pass = config.get("sql_password")
+
+            conn = connect_sql_server(driver, server, db_name, sql_user, sql_pass)
             cursor = conn.cursor()
             cursor.execute("SELECT is_cdc_enabled FROM sys.databases WHERE name = ?", (db_name,))
             result = cursor.fetchone()
@@ -1840,7 +1922,11 @@ class MigrationGUI(QMainWindow):
                 
                 driver = self.get_full_driver_name()
 
-                sql_conn = connect_sql_server(driver,server, db_name)
+                # --- NEW: Retrieve SQL credentials for maintenance tasks ---
+                sql_user = config.get("sql_user")
+                sql_pass = config.get("sql_password")
+
+                sql_conn = connect_sql_server(driver, server, db_name, sql_user, sql_pass)
                 sql_cursor = sql_conn.cursor()
 
                 # Connect to MySQL
@@ -1966,8 +2052,12 @@ class MigrationGUI(QMainWindow):
                 
                 driver = self.get_full_driver_name()
 
+                # --- NEW: Retrieve SQL credentials for maintenance tasks ---
+                sql_user = config.get("sql_user")
+                sql_pass = config.get("sql_password")
+
                 # Connect to SQL Server
-                sql_conn = connect_sql_server(driver,server, db_name)
+                sql_conn = connect_sql_server(driver, server, db_name, sql_user, sql_pass)
                 sql_cursor = sql_conn.cursor()
 
                 # --- Attempt to Connect to MySQL and Check for migration_log table ---
@@ -2092,7 +2182,11 @@ class MigrationGUI(QMainWindow):
 
             driver = self.get_full_driver_name()
 
-            sql_conn = connect_sql_server(driver,server, db_name)
+            # --- NEW: Retrieve SQL credentials for maintenance tasks ---
+            sql_user = config.get("sql_user")
+            sql_pass = config.get("sql_password")
+
+            sql_conn = connect_sql_server(driver, server, db_name, sql_user, sql_pass)
             sql_cursor = sql_conn.cursor()
 
             query = """
@@ -2156,7 +2250,11 @@ class MigrationGUI(QMainWindow):
 
                 driver = self.get_full_driver_name()
 
-                sql_conn = connect_sql_server(driver, sql_server, source_db)
+                # --- NEW: Retrieve SQL credentials for maintenance tasks ---
+                sql_user = config.get("sql_user")
+                sql_pass = config.get("sql_password")
+
+                sql_conn = connect_sql_server(driver, sql_server, source_db, sql_user, sql_pass)
                 sql_cursor = sql_conn.cursor()
 
                 mysql_conn = mysql.connector.connect(
@@ -2230,38 +2328,6 @@ class MigrationGUI(QMainWindow):
                 if mysql_conn and mysql_conn.is_connected():
                     mysql_conn.close() # إغلاق الاتصال فوراً لتحريره للمجمع
                     self.log("MySQL connection closed safely.")
-
-    # def run_daily_cdc_schedule(self):
-    #         """
-    #         Runs daily CDC deactivation and reactivation at specific times.
-    #         - Deactivate: 03:00 AM (03:00)
-    #         - Activate: 3:05 AM (2:05) - Assuming 5 minutes downtime for maintenance, adjust as needed.
-    #         """
-    #         if self.is_scheduler_running:
-    #             return
-            
-    #         now = datetime.now()
-            
-    #         # Time for CDC Deactivation (03:00 AM)
-    #         if now.hour == 3 and now.minute == 0:
-    #             self.log("--- Daily CDC Deactivation triggered at 03:00 ---")
-    #             # Stop the continuous migration thread if it's running before disabling CDC
-    #             if self.migration_thread and self.migration_thread.running:
-    #                 self.stop_migration()
-                    
-    #             self.deactivate_cdc(show_message=False)
-    #             self.log("--- Daily CDC Deactivation complete ---")
-                
-    #         # Time for CDC Reactivation (03:05 AM - allowing 5 minutes for deactivation process)
-    #         # We perform activation shortly after deactivation to minimize downtime.
-    #         if now.hour == 3 and now.minute == 5: 
-    #             self.log("--- Daily CDC Reactivation triggered at 03:05 ---")
-    #             self.activate_cdc(show_message=False)
-    #             self.log("--- Daily CDC Reactivation complete ---")
-                
-    #             # Restart the migration thread if it was running previously
-    #             if self.start_btn.isEnabled(): # Check if migration is not currently running
-    #                 self.start_migration() # This restarts the data sync
 
 
     def run_daily_cdc_schedule(self):
@@ -2349,9 +2415,12 @@ class MigrationGUI(QMainWindow):
                     mysql_pass = config.get("mysql_password")
                     mysql_db = config.get("mysql_db_name")
 
+                    sql_user = config.get("sql_user")
+                    sql_pass = config.get("sql_password")
+
                     driver = self.get_full_driver_name()
 
-                    sql_conn = connect_sql_server(driver, sql_server, source_db)
+                    sql_conn = connect_sql_server(driver, sql_server, source_db, sql_user, sql_pass)
                     sql_cursor = sql_conn.cursor()
                     mysql_conn, mysql_cursor = connect_mysql(mysql_db, mysql_host, mysql_user, mysql_pass)
 
